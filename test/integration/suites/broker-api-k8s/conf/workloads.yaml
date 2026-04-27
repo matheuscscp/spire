@@ -1,0 +1,147 @@
+# The "target" workload — a regular pod the broker(s) will fetch SVIDs for
+# via PID reference and via KubernetesObjectReference(pods/core).
+# It runs `spire-agent api watch` so it stays alive with a steady PID.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: target-pod
+  namespace: spire
+  labels:
+    app: target-pod
+spec:
+  hostPID: true
+  containers:
+    - name: target
+      image: spire-agent:latest-local
+      imagePullPolicy: Never
+      command: ["/opt/spire/bin/spire-agent", "api", "watch"]
+      args: ["-socketPath", "/run/spire/agent-sockets/api.sock"]
+      volumeMounts:
+        - name: spire-agent-socket
+          mountPath: /run/spire/agent-sockets
+          readOnly: false
+  volumes:
+    - name: spire-agent-socket
+      hostPath:
+        path: /run/spire/agent-sockets
+        type: Directory
+
+---
+# The "target" non-pod object — a Flux Kustomization CR. No controller is
+# required; the resource just needs to exist in the API server so the broker
+# can reference it.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: target-kustomization
+  namespace: spire
+spec:
+  interval: 1m
+  path: ./apps
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: dummy
+
+---
+# The "broker" — authorized in the agent config to use any reference type.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: broker
+  namespace: spire
+  labels:
+    app: broker
+spec:
+  hostPID: true
+  containers:
+    - name: broker
+      image: broker-client:latest-local
+      imagePullPolicy: Never
+      command: ["/bin/sleep", "infinity"]
+      volumeMounts:
+        - name: spire-agent-socket
+          mountPath: /run/spire/agent-sockets
+          readOnly: false
+        - name: spire-broker-socket
+          mountPath: /run/spire/broker-sockets
+          readOnly: false
+  volumes:
+    - name: spire-agent-socket
+      hostPath:
+        path: /run/spire/agent-sockets
+        type: Directory
+    - name: spire-broker-socket
+      hostPath:
+        path: /run/spire/broker-sockets
+        type: Directory
+
+---
+# The "restricted broker" — authorized in the agent config but limited to
+# WorkloadPIDReference only. KubernetesObjectReference attempts should be
+# rejected with PermissionDenied at the gRPC layer.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: restricted-broker
+  namespace: spire
+  labels:
+    app: restricted-broker
+spec:
+  hostPID: true
+  containers:
+    - name: restricted-broker
+      image: broker-client:latest-local
+      imagePullPolicy: Never
+      command: ["/bin/sleep", "infinity"]
+      volumeMounts:
+        - name: spire-agent-socket
+          mountPath: /run/spire/agent-sockets
+          readOnly: false
+        - name: spire-broker-socket
+          mountPath: /run/spire/broker-sockets
+          readOnly: false
+  volumes:
+    - name: spire-agent-socket
+      hostPath:
+        path: /run/spire/agent-sockets
+        type: Directory
+    - name: spire-broker-socket
+      hostPath:
+        path: /run/spire/broker-sockets
+        type: Directory
+
+---
+# The "unauthorized workload" — gets its own SVID via the Workload API just
+# fine, but isn't in the agent's broker allowlist. Attempts to dial the
+# broker endpoint should fail at the mTLS layer.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: unauthorized-workload
+  namespace: spire
+  labels:
+    app: unauthorized-workload
+spec:
+  hostPID: true
+  containers:
+    - name: unauthorized-workload
+      image: broker-client:latest-local
+      imagePullPolicy: Never
+      command: ["/bin/sleep", "infinity"]
+      volumeMounts:
+        - name: spire-agent-socket
+          mountPath: /run/spire/agent-sockets
+          readOnly: false
+        - name: spire-broker-socket
+          mountPath: /run/spire/broker-sockets
+          readOnly: false
+  volumes:
+    - name: spire-agent-socket
+      hostPath:
+        path: /run/spire/agent-sockets
+        type: Directory
+    - name: spire-broker-socket
+      hostPath:
+        path: /run/spire/broker-sockets
+        type: Directory

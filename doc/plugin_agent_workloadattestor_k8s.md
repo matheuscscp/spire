@@ -48,6 +48,7 @@ since [hostprocess](https://kubernetes.io/docs/tasks/configure-pod-container/cre
 
 | Configuration                    | Description                                                                                                                                                                                                                             |
 |----------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `api_server_cache.enabled`       | If true, enables a controller-runtime Kubernetes API server cache for object-reference lookups. Defaults to false.                                                                                                                      |
 | `disable_container_selectors`    | If true, container selectors are not produced. This can be used to produce pod selectors when the workload pod is known but the workload container is not ready at the time of attestation.                                             |
 | `kubelet_read_only_port`         | The kubelet read-only port. This is mutually exclusive with `kubelet_secure_port`.                                                                                                                                                      |
 | `kubelet_secure_port`            | The kubelet secure port. It defaults to `10250` unless `kubelet_read_only_port` is set.                                                                                                                                                 |
@@ -125,6 +126,58 @@ If `ignore_tlog` is set to `true`, the selectors based on the Rekor bundle (`-lo
 > the pod, whereas `pod-image` and `pod-init-image` will match against ANY container or init container in the Pod,
 > respectively.
 
+### Broker API: KubernetesObjectReference
+
+When SPIRE Agent's [SPIFFE Broker API](spire_agent.md#spiffe-broker-api) is
+enabled, this plugin can also handle `KubernetesObjectReference` references.
+The reference identifies the target object by its resource (`<plural>.<group>`,
+with `core` as the group string for core resources) and either its namespaced
+name (`namespace` + `name`), its `uid`, or both. The plugin resolves the object
+via the kubelet (for pods on the same node) or the Kubernetes API server, then
+emits a set of selectors describing that object. Kubernetes API server lookups
+require the agent ServiceAccount to have RBAC permission for the referenced
+resource.
+
+**Pods (`pods/core`).** A `KubernetesObjectReference` to a pod is attested
+through the same pod-resolution path as the legacy PID reference and emits
+the **same** pod-shaped selectors documented in the table above
+(`k8s:ns`, `k8s:sa`, `k8s:pod-name`, `k8s:container-name`, `k8s:pod-uid`,
+`k8s:pod-label`, `k8s:pod-image`, `k8s:pod-owner`, ...). A registration
+entry written for the legacy PID flow continues to match either reference
+type.
+
+**Other resources (any `<plural>.<group>` for which the agent has RBAC).**
+The agent fetches the object's `metadata` via the Kubernetes API server
+(using a `PartialObjectMetadata` request) and emits a uniform vocabulary
+that is independent of the resource's kind:
+
+| Selector                | Value                                                                                                       |
+|-------------------------|-------------------------------------------------------------------------------------------------------------|
+| k8s:uid                 | The object's UID.                                                                                           |
+| k8s:resource            | `<plural>.<group>` for the resource (e.g. `deployments.apps`, `pods.core`).                                 |
+| k8s:plural              | The resource plural (e.g. `deployments`).                                                                   |
+| k8s:group               | The API group (e.g. `apps`); `core` for core resources.                                                     |
+| k8s:version             | The discovered version (e.g. `v1`, `v1beta1`).                                                              |
+| k8s:apiVersion          | The Kubernetes wire form: `v1` for core or `<group>/<version>` otherwise.                                   |
+| k8s:kind                | The object kind (e.g. `Deployment`).                                                                        |
+| k8s:name                | The object name.                                                                                            |
+| k8s:namespace           | The object namespace; omitted for cluster-scoped objects.                                                   |
+| k8s:key                 | `<namespace>/<name>` for namespaced objects, or just `<name>` for cluster-scoped ones.                      |
+| k8s:label               | A label on the object, formatted `<key>:<value>` (one selector per label entry).                            |
+| k8s:owner-key           | `<group>/<Kind>/<name>` for each entry in `metadata.ownerReferences`.                                       |
+| k8s:owner-uid           | `<group>/<Kind>/<uid>` for each entry in `metadata.ownerReferences`.                                        |
+| k8s:controller-key      | Same as `k8s:owner-key`, but only emitted for owner references with `Controller: true`.                     |
+| k8s:controller-uid      | Same as `k8s:owner-uid`, but only emitted for owner references with `Controller: true`.                     |
+
+Annotations are intentionally **not** exposed as selectors. Kubernetes labels
+are validated and indexed by the API server and are the appropriate identity
+anchor; annotations are an unconstrained metadata grab bag (often multi-line
+JSON) that does not fit equality-matched selectors.
+
+The agent's ServiceAccount needs `get` (and `list` when references identify
+objects by `uid` alone) permission on every resource it is expected to
+resolve via this path.
+
 ### Image selector limitations
 
 The `container-image`, `pod-image`, and `pod-init-image` selectors are derived from two fields in the Kubernetes [ContainerStatus](https://pkg.go.dev/k8s.io/api/core/v1#ContainerStatus): `Image` (typically the tag-based name, e.g. `myimage:v1.2.3`) and `ImageID` (typically the digest-based identifier, e.g. `myimage@sha256:abc...`). Both values are emitted as selectors for each container to support matching by either form.
@@ -197,6 +250,18 @@ WorkloadAttestor "k8s" {
     kubelet_ca_path = "/path/to/kubelet-ca.pem"
     certificate_path = "/path/to/cert.pem"
     private_key_path = "/path/to/key.pem"
+  }
+}
+```
+
+To enable the Kubernetes API server cache used by object-reference lookups:
+
+```hcl
+WorkloadAttestor "k8s" {
+  plugin_data {
+    api_server_cache {
+      enabled = true
+    }
   }
 }
 ```

@@ -1,0 +1,40 @@
+#!/bin/bash
+
+set -e
+
+source init-kubectl
+
+NODEUID=$(./bin/kubectl get nodes broker-api-k8s-control-plane -o jsonpath='{.metadata.uid}')
+PARENT="spiffe://example.org/spire/agent/k8s_psat/example-cluster/${NODEUID}"
+
+create-entry() {
+    spiffeID=$1; shift
+    log-info "creating entry ${spiffeID}..."
+    ./bin/kubectl -nspire exec -t deployment/spire-server -- \
+        /opt/spire/bin/spire-server entry create \
+            -spiffeID "${spiffeID}" \
+            -parentID "${PARENT}" \
+            "$@"
+}
+
+# Brokers — registered by their pod-name selectors.
+create-entry "spiffe://example.org/broker"               -selector "k8s:pod-name:broker"
+create-entry "spiffe://example.org/restricted-broker"    -selector "k8s:pod-name:restricted-broker"
+create-entry "spiffe://example.org/unauthorized-workload" -selector "k8s:pod-name:unauthorized-workload"
+
+# Target pod — matched by the legacy PID path AND by the new
+# KubernetesObjectReference(pods/core) path. The k8s attestor emits
+# `pod-name` in both cases.
+create-entry "spiffe://example.org/target-pod" -selector "k8s:pod-name:target-pod"
+
+# Target Kustomization — matched by the uniform object-meta selector
+# vocabulary emitted by getSelectorValuesFromObjectMeta.
+create-entry "spiffe://example.org/target-kustomization" \
+    -selector "k8s:resource:kustomizations.kustomize.toolkit.fluxcd.io" \
+    -selector "k8s:namespace:spire" \
+    -selector "k8s:name:target-kustomization"
+
+# Give the agent a moment to sync entries before the test steps invoke
+# brokerclient (the binary will also retry internally via the workloadapi
+# source, so this is just a fast-path comfort wait).
+sleep 15
