@@ -53,6 +53,11 @@ wait-for-rollout spire daemonset/spire-agent
 
 ./bin/kubectl apply -f ./conf/workloads.yaml
 wait-for-pod-ready spire target-pod
+wait-for-pod-ready spire same-node-target-pod
+wait-for-pod-ready spire other-node-target-pod
 wait-for-pod-ready spire broker
+wait-for-pod-ready spire cluster-broker
+wait-for-pod-ready spire agent-node-broker
 wait-for-pod-ready spire restricted-broker
+wait-for-pod-ready spire rbac-denied-broker
 wait-for-pod-ready spire unauthorized-workload

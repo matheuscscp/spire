@@ -567,6 +567,12 @@ The specification currently defines two reference types:
   generic `k8s:resource`, `k8s:kind`, `k8s:name`, ... for any other
   resource).
 
+When the `k8s` workload attestor handles Broker API `AttestReference` calls,
+its plugin-level `broker` block is required for every reference type. It uses
+that broker configuration to run Kubernetes `SubjectAccessReview` checks
+against the resolved pod for `WorkloadPIDReference`, and against the referenced
+object for `KubernetesObjectReference`.
+
 ### Transport and authentication
 
 The Broker API is gated by mutual TLS using X.509-SVIDs. A broker is

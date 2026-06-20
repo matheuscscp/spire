@@ -60,6 +60,7 @@ since [hostprocess](https://kubernetes.io/docs/tasks/configure-pod-container/cre
 | `use_anonymous_authentication`   | If true, use anonymous authentication for kubelet communication                                                                                                                                                                         |
 | `node_name_env`                  | The environment variable used to obtain the node name. Defaults to `MY_NODE_NAME`.                                                                                                                                                      |
 | `node_name`                      | The name of the node. Overrides the value obtained by the environment variable specified by `node_name_env`.                                                                                                                            |
+| `broker`                         | Broker API options for `AttestReference`. Required when this plugin handles Broker API references. See [Broker API](#broker-api).                                                                                                       |
 | `sigstore`                       | Sigstore options. Options described below. See [Sigstore options](#sigstore-options). When set, enables verification of container image signatures and attestations.                                                                    |
 | `use_new_container_locator`      | If true, enables the new container locator algorithm that has support for cgroups v2. Defaults to true.                                                                                                                                 |
 | `verbose_container_locator_logs` | If true, enables verbose logging of mountinfo and cgroup information used to locate containers. Defaults to false.                                                                                                                      |
@@ -126,27 +127,72 @@ If `ignore_tlog` is set to `true`, the selectors based on the Rekor bundle (`-lo
 > the pod, whereas `pod-image` and `pod-init-image` will match against ANY container or init container in the Pod,
 > respectively.
 
-### Broker API: KubernetesObjectReference
+### Broker API
 
 When SPIRE Agent's [SPIFFE Broker API](spire_agent.md#spiffe-broker-api) is
-enabled, this plugin can also handle `KubernetesObjectReference` references.
-The reference identifies the target object by its resource (`<plural>.<group>`,
-with `core` as the group string for core resources) and either its namespaced
-name (`namespace` + `name`), its `uid`, or both. The plugin resolves the object
-via the kubelet (for pods on the same node) or the Kubernetes API server, then
-emits a set of selectors describing that object. Kubernetes API server lookups
-require the agent ServiceAccount to have RBAC permission for the referenced
+enabled, the k8s workload attestor handles Broker API `AttestReference`
+requests for `WorkloadPIDReference` and `KubernetesObjectReference`.
+`AttestReference` requires a `broker` block in the plugin configuration. Each
+`broker.brokers` entry identifies one broker SPIFFE ID that may use this
+plugin. Broker IDs must be valid, unique, and non-empty. Each broker may set
+`pod_reference_scope` to `agent_node` (default) or `cluster`; this only affects
+pod `KubernetesObjectReference` resolution.
+
+Example:
+
+```hcl
+WorkloadAttestor "k8s" {
+  plugin_data {
+    broker {
+      brokers = [
+        {
+          id = "spiffe://example.org/broker"
+          pod_reference_scope = "cluster"
+        }
+      ]
+    }
+  }
+}
+```
+
+`WorkloadPIDReference` follows the legacy PID-based k8s attestation path to
+resolve the workload pod and selectors. When that Broker API reference
+resolves to a pod, the plugin creates a `SubjectAccessReview` asking whether
+the broker SPIFFE ID may use SPIRE's custom Kubernetes authorization verb
+`impersonate-via-spire` on the resolved pod. The review uses the broker
+SPIFFE ID as the SAR username and does not set groups. Legacy PID attestation
+via the workload attestor's `Attest` RPC does not use the broker configuration
+or run this review.
+
+For `KubernetesObjectReference`, the reference identifies the target object by
+its resource (`<plural>.<group>`, with `core` as the group string for core
+resources) and either its namespaced name (`namespace` + `name`), its `uid`,
+or both. Pod references try the local kubelet pod list first, then may fall
+back to the Kubernetes API server. With the default
+`pod_reference_scope = "agent_node"`, API server results are accepted only
+when the resolved pod's `spec.nodeName` matches the agent node name from
+`node_name` or `node_name_env`. With `pod_reference_scope = "cluster"`, pod
+references may resolve to pods on any node. Non-pod object references are
+resolved through the Kubernetes API server. The plugin then creates the same
+`SubjectAccessReview` for the referenced object. The review uses the broker
+SPIFFE ID as the SAR username, no groups, the reference's resource group and
+plural, and the resolved namespace and name. If the authorizer denies the
+review, attestation fails with `PermissionDenied`. Kubernetes API server
+lookups require the agent ServiceAccount to have permission for the referenced
 resource.
 
 **Pods (`pods/core`).** A `KubernetesObjectReference` to a pod is attested
 through the same pod-resolution path as the legacy PID reference and emits
 the **same** pod-shaped selectors documented in the table above
 (`k8s:ns`, `k8s:sa`, `k8s:pod-name`, `k8s:container-name`, `k8s:pod-uid`,
-`k8s:pod-label`, `k8s:pod-image`, `k8s:pod-owner`, ...). A registration
-entry written for the legacy PID flow continues to match either reference
-type.
+`k8s:pod-label`, `k8s:pod-image`, `k8s:pod-owner`, ...). By default, broker
+pod references are limited to pods scheduled to the agent's node
+(`agent_node`), even when the pod is resolved through the Kubernetes API
+server. Set `pod_reference_scope = "cluster"` for a broker that must
+reference pods on other nodes. A registration entry written for the legacy
+PID flow continues to match either reference type.
 
-**Other resources (any `<plural>.<group>` for which the agent has RBAC).**
+**Other resources (any `<plural>.<group>` for which the agent has permission).**
 The agent fetches the object's `metadata` via the Kubernetes API server
 (using a `PartialObjectMetadata` request) and emits a uniform vocabulary
 that is independent of the resource's kind:
@@ -176,7 +222,93 @@ JSON) that does not fit equality-matched selectors.
 
 The agent's ServiceAccount needs `get` (and `list` when references identify
 objects by `uid` alone) permission on every resource it is expected to
-resolve via this path.
+resolve via this path. It also needs `create` on
+`subjectaccessreviews.authorization.k8s.io` to perform broker authorization
+checks. For example:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-agent-k8s-attestor
+rules:
+  # Object-reference resolution. Add every resource brokers may reference.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["get", "list"]
+
+  # Required so the k8s workload attestor can create SubjectAccessReview
+  # objects while handling Broker API reference requests.
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-agent-k8s-attestor
+subjects:
+  - kind: ServiceAccount
+    name: spire-agent
+    namespace: spire
+roleRef:
+  kind: ClusterRole
+  name: spire-agent-k8s-attestor
+  apiGroup: rbac.authorization.k8s.io
+```
+
+The Kubernetes authorizer must also allow the broker SPIFFE ID to use SPIRE's
+custom **`impersonate-via-spire`** verb on the resources brokers may reference.
+The `SubjectAccessReview` checks the broker SPIFFE ID as a Kubernetes username
+and does not set groups. The broker pod's Kubernetes ServiceAccount is not
+used as the reviewed subject.
+
+SPIRE intentionally does **not** use Kubernetes' built-in `impersonate` verb
+for this check. The built-in verb has broader meaning in Kubernetes RBAC: it
+can authorize native impersonation of users, groups, ServiceAccounts, and
+other impersonation targets. Granting that built-in verb to broker-related
+Kubernetes identities would create powerful RBAC subjects with permissions
+outside SPIRE's broker authorization decision. The `impersonate-via-spire`
+verb is a SPIRE-specific authorization gate checked only by this
+`SubjectAccessReview`; granting it lets Kubernetes answer SPIRE's question
+without granting Kubernetes-native impersonation power.
+
+For example, with broker ID `spiffe://example.org/broker`:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-broker-impersonation
+rules:
+  # This is the broker authorization decision enforced by SubjectAccessReview.
+  # Use SPIRE's custom verb, not Kubernetes' built-in `impersonate` verb.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["impersonate-via-spire"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["impersonate-via-spire"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-broker-impersonation
+subjects:
+  - kind: User
+    name: spiffe://example.org/broker
+roleRef:
+  kind: ClusterRole
+  name: spire-broker-impersonation
+  apiGroup: rbac.authorization.k8s.io
+```
+
+A `Role` and `RoleBinding` can be used instead when brokers should only be
+allowed to authorize SPIRE broker references for namespaced resources in a
+specific namespace.
 
 ### Image selector limitations
 

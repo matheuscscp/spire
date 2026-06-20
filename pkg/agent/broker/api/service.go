@@ -13,6 +13,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/spire/pkg/agent/api/rpccontext"
 	workloadattestor "github.com/spiffe/spire/pkg/agent/attestor/workload"
+	"github.com/spiffe/spire/pkg/agent/broker/brokercontext"
 	"github.com/spiffe/spire/pkg/agent/client"
 	"github.com/spiffe/spire/pkg/agent/common/hintsfilter"
 	"github.com/spiffe/spire/pkg/agent/manager"
@@ -153,7 +154,7 @@ func (s *Service) SubscribeToX509SVID(req *broker.SubscribeToX509SVIDRequest, st
 		return err
 	}
 
-	selectors, err := s.constructValidSelectorsFromReference(ctx, log, req.Reference)
+	selectors, err := s.constructValidSelectorsFromReference(brokercontext.WithCallerID(ctx, peer), log, req.Reference)
 	if err != nil {
 		return err
 	}
@@ -203,7 +204,7 @@ func (s *Service) SubscribeToX509Bundles(req *broker.SubscribeToX509BundlesReque
 	// The bundle response is workload-independent, but per the SPIFFE Broker
 	// API spec the request still identifies a workload. Validate the reference
 	// resolves so a caller can't pull bundles for workloads it can't attest.
-	if _, err := s.constructValidSelectorsFromReference(ctx, log, req.Reference); err != nil {
+	if _, err := s.constructValidSelectorsFromReference(brokercontext.WithCallerID(ctx, peer), log, req.Reference); err != nil {
 		return err
 	}
 
@@ -253,7 +254,7 @@ func (s *Service) FetchJWTSVID(ctx context.Context, req *broker.FetchJWTSVIDRequ
 		return nil, err
 	}
 
-	selectors, err := s.constructValidSelectorsFromReference(ctx, log, req.Reference)
+	selectors, err := s.constructValidSelectorsFromReference(brokercontext.WithCallerID(ctx, peer), log, req.Reference)
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +312,7 @@ func (s *Service) SubscribeToJWTBundles(req *broker.SubscribeToJWTBundlesRequest
 	// The bundle response is workload-independent, but per the SPIFFE Broker
 	// API spec the request still identifies a workload. Validate the reference
 	// resolves so a caller can't pull bundles for workloads it can't attest.
-	if _, err := s.constructValidSelectorsFromReference(ctx, log, req.Reference); err != nil {
+	if _, err := s.constructValidSelectorsFromReference(brokercontext.WithCallerID(ctx, peer), log, req.Reference); err != nil {
 		return err
 	}
 

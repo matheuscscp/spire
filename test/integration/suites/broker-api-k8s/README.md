@@ -9,6 +9,8 @@ real workloads. Covers:
   PID-based path).
 * A broker fetches a pod workload's SVID via `KubernetesObjectReference`
   (`pods/core`).
+* Cluster-scoped and agent-node-scoped brokers fetch same-node pod SVIDs, while
+  only the cluster-scoped broker can fetch an other-node pod SVID.
 * A broker fetches a **non-pod** object's SVID via `KubernetesObjectReference`
   (`kustomizations.kustomize.toolkit.fluxcd.io`) — exercises the generic
   object-attestation path that resolves the resource via the REST mapper and
@@ -16,6 +18,10 @@ real workloads. Covers:
 * A broker whose `allowed_reference_types` is restricted to PID references
   gets `PermissionDenied` at the gRPC layer when it asks for a
   `KubernetesObjectReference`.
+* A broker whose `allowed_reference_types` permits PID and
+  `KubernetesObjectReference` requests, but whose broker SPIFFE ID lacks
+  `impersonate-via-spire` authorization, gets `PermissionDenied` from the k8s
+  attestor's `SubjectAccessReview`.
 * A workload that is not in the agent's broker allowlist can still use the
   Workload API to fetch its own SVID, but is rejected at the mTLS layer when
   it tries to dial the broker endpoint as a broker.
@@ -29,3 +35,7 @@ real workloads. Covers:
 
 Only the Flux Kustomization CRD is installed (no controllers); the resource
 just needs to exist in the API server so the broker can reference it.
+
+The agent RBAC fixture grants `create` on
+`subjectaccessreviews.authorization.k8s.io` because the k8s workload attestor
+uses SubjectAccessReview API calls to authorize Broker API reference requests.

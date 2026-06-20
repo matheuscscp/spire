@@ -9,6 +9,7 @@ metadata:
 # Cluster role granting the agent permission to:
 #  - read pods/nodes for the legacy PID/k8s_psat path
 #  - read Kustomization CRs so the broker API can attest non-pod object references
+#  - create SubjectAccessReviews for broker authorization checks
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
@@ -20,6 +21,44 @@ rules:
   - apiGroups: ["kustomize.toolkit.fluxcd.io"]
     resources: ["kustomizations"]
     verbs: ["get", "list"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+
+---
+# Cluster role used by the k8s workload attestor's SubjectAccessReview check.
+# The broker SPIFFE ID is used as the SubjectAccessReview username.
+# Use SPIRE's custom verb, not Kubernetes' built-in `impersonate` verb.
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: spire-broker-impersonation-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["impersonate-via-spire"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["impersonate-via-spire"]
+
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: spire-broker-impersonation-role-binding
+subjects:
+  - kind: User
+    name: spiffe://example.org/broker
+  - kind: User
+    name: spiffe://example.org/cluster-broker
+  - kind: User
+    name: spiffe://example.org/agent-node-broker
+  - kind: User
+    name: spiffe://example.org/restricted-broker
+roleRef:
+  kind: ClusterRole
+  name: spire-broker-impersonation-role
+  apiGroup: rbac.authorization.k8s.io
 
 ---
 kind: ClusterRoleBinding
@@ -71,9 +110,28 @@ data:
               allowed_reference_types = ["*"]
             },
             {
+              id = "spiffe://example.org/cluster-broker"
+              allowed_reference_types = [
+                "type.googleapis.com/spiffe.broker.KubernetesObjectReference",
+              ]
+            },
+            {
+              id = "spiffe://example.org/agent-node-broker"
+              allowed_reference_types = [
+                "type.googleapis.com/spiffe.broker.KubernetesObjectReference",
+              ]
+            },
+            {
               id = "spiffe://example.org/restricted-broker"
               allowed_reference_types = [
                 "type.googleapis.com/spiffe.broker.WorkloadPIDReference",
+              ]
+            },
+            {
+              id = "spiffe://example.org/rbac-denied-broker"
+              allowed_reference_types = [
+                "type.googleapis.com/spiffe.broker.WorkloadPIDReference",
+                "type.googleapis.com/spiffe.broker.KubernetesObjectReference",
               ]
             },
           ]
@@ -97,9 +155,34 @@ data:
         plugin_data {
           # Skip kubelet cert verification (kind doesn't ship a CA bundle entry for it).
           skip_kubelet_verification = true
+          node_name_env = "MY_NODE_NAME"
 
           api_server_cache {
             enabled = true
+          }
+
+          # Broker-specific Kubernetes authorization config.
+          # The broker SPIFFE ID is used as the SubjectAccessReview username.
+          broker {
+            brokers = [
+              {
+                id = "spiffe://example.org/broker"
+              },
+              {
+                id = "spiffe://example.org/cluster-broker"
+                pod_reference_scope = "cluster"
+              },
+              {
+                id = "spiffe://example.org/agent-node-broker"
+                pod_reference_scope = "agent_node"
+              },
+              {
+                id = "spiffe://example.org/restricted-broker"
+              },
+              {
+                id = "spiffe://example.org/rbac-denied-broker"
+              },
+            ]
           }
         }
       }
@@ -142,6 +225,11 @@ spec:
           image: spire-agent:latest-local
           imagePullPolicy: Never
           args: ["-config", "/run/spire/config/agent.conf"]
+          env:
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           ports:
             - name: broker
               containerPort: 8443

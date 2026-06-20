@@ -5,7 +5,7 @@ source init-kubectl
 if [ -z "$SUCCESS" ]; then
     ./bin/kubectl -nspire logs deployment/spire-server --all-containers || true
     ./bin/kubectl -nspire logs daemonset/spire-agent --all-containers || true
-    for pod in broker restricted-broker unauthorized-workload target-pod; do
+    for pod in broker cluster-broker agent-node-broker restricted-broker rbac-denied-broker unauthorized-workload target-pod same-node-target-pod other-node-target-pod; do
         ./bin/kubectl -nspire logs "pod/${pod}" --all-containers || true
         ./bin/kubectl -nspire describe "pod/${pod}" || true
     done

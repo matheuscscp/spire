@@ -1,0 +1,43 @@
+#!/bin/bash
+
+set -e
+
+source init-kubectl
+
+log-info "Test: cluster-scoped broker fetches same-node pod SVID"
+
+./bin/kubectl -nspire exec -t cluster-broker -- /brokerclient \
+    -ref-type object \
+    -plural pods -group core \
+    -namespace spire -name same-node-target-pod \
+    -expected-spiffe spiffe://example.org/same-node-target-pod \
+    || fail-now "cluster-scoped broker failed to fetch same-node pod SVID"
+
+log-info "Test: agent-node-scoped broker fetches same-node pod SVID"
+
+./bin/kubectl -nspire exec -t agent-node-broker -- /brokerclient \
+    -ref-type object \
+    -plural pods -group core \
+    -namespace spire -name same-node-target-pod \
+    -expected-spiffe spiffe://example.org/same-node-target-pod \
+    || fail-now "agent-node-scoped broker failed to fetch same-node pod SVID"
+
+log-info "Test: cluster-scoped broker fetches other-node pod SVID"
+
+./bin/kubectl -nspire exec -t cluster-broker -- /brokerclient \
+    -ref-type object \
+    -plural pods -group core \
+    -namespace spire -name other-node-target-pod \
+    -expected-spiffe spiffe://example.org/other-node-target-pod \
+    || fail-now "cluster-scoped broker failed to fetch other-node pod SVID"
+
+log-info "Test: agent-node-scoped broker cannot fetch other-node pod SVID"
+
+./bin/kubectl -nspire exec -t agent-node-broker -- /brokerclient \
+    -ref-type object \
+    -plural pods -group core \
+    -namespace spire -name other-node-target-pod \
+    -expect-err PermissionDenied \
+    || fail-now "agent-node-scoped broker was not denied for other-node pod SVID"
+
+log-success "pod reference scope scenarios behaved as expected"

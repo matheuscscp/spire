@@ -10,7 +10,7 @@ KUBECTL_PATH=./bin/kubectl
 download-kind "${KIND_PATH}"
 download-kubectl "${KUBECTL_PATH}"
 
-start-kind-cluster "${KIND_PATH}" broker-api-k8s
+start-kind-cluster "${KIND_PATH}" broker-api-k8s ./conf/kind-config.yaml
 
 # Build the brokerclient binary and bake it into a tiny image.
 log-info "building brokerclient and broker-client image..."

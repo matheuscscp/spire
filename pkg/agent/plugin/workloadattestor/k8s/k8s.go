@@ -22,8 +22,10 @@ import (
 	"github.com/hashicorp/hcl"
 	hcltoken "github.com/hashicorp/hcl/hcl/token"
 	"github.com/spiffe/go-spiffe/v2/exp/proto/spiffe/broker"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	workloadattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/agent/workloadattestor/v1"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
+	"github.com/spiffe/spire/pkg/agent/broker/brokercontext"
 	"github.com/spiffe/spire/pkg/agent/common/sigstore"
 	"github.com/spiffe/spire/pkg/common/catalog"
 	"github.com/spiffe/spire/pkg/common/pemutil"
@@ -33,6 +35,8 @@ import (
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/anypb"
+	authv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -56,20 +60,31 @@ func init() {
 	if err := corev1.AddToScheme(k8sScheme); err != nil {
 		panic(fmt.Sprintf("failed to register corev1 scheme: %v", err))
 	}
+	if err := authv1.AddToScheme(k8sScheme); err != nil {
+		panic(fmt.Sprintf("failed to register authv1 scheme: %v", err))
+	}
 }
 
 const (
-	pluginName               = "k8s"
-	defaultMaxPollAttempts   = 60
-	defaultPollRetryInterval = time.Millisecond * 500
-	defaultSecureKubeletPort = 10250
-	defaultKubeletCAPath     = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-	defaultTokenPath         = "/var/run/secrets/kubernetes.io/serviceaccount/token" //nolint: gosec // false positive
-	defaultNodeNameEnv       = "MY_NODE_NAME"
-	defaultReloadInterval    = time.Minute
+	pluginName                    = "k8s"
+	brokerImpersonationReviewVerb = "impersonate-via-spire"
+	defaultMaxPollAttempts        = 60
+	defaultPollRetryInterval      = time.Millisecond * 500
+	defaultSecureKubeletPort      = 10250
+	defaultKubeletCAPath          = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	defaultTokenPath              = "/var/run/secrets/kubernetes.io/serviceaccount/token" //nolint: gosec // false positive
+	defaultNodeNameEnv            = "MY_NODE_NAME"
+	defaultReloadInterval         = time.Minute
 
 	workloadPIDReferenceTypeURL      = "type.googleapis.com/spiffe.broker.WorkloadPIDReference"
 	kubernetesObjectReferenceTypeURL = "type.googleapis.com/spiffe.broker.KubernetesObjectReference"
+)
+
+type podReferenceScope string
+
+const (
+	podReferenceScopeAgentNode podReferenceScope = "agent_node"
+	podReferenceScopeCluster   podReferenceScope = "cluster"
 )
 
 var (
@@ -169,6 +184,22 @@ type HCLConfig struct {
 	// APIServerCache contains Kubernetes API server cache-specific configs.
 	APIServerCache *k8sAPIServerCacheHCLConfig `hcl:"api_server_cache"`
 
+	// Broker contains SPIFFE Broker API-specific configuration.
+	Broker *k8sBrokerHCLConfig `hcl:"broker"`
+
+	UnusedKeyPositions map[string][]hcltoken.Pos `hcl:",unusedKeyPositions"`
+}
+
+type k8sBrokerHCLConfig struct {
+	Brokers []k8sBrokerHCLEntry `hcl:"brokers"`
+
+	UnusedKeyPositions map[string][]hcltoken.Pos `hcl:",unusedKeyPositions"`
+}
+
+type k8sBrokerHCLEntry struct {
+	ID                string `hcl:"id"`
+	PodReferenceScope string `hcl:"pod_reference_scope"`
+
 	UnusedKeyPositions map[string][]hcltoken.Pos `hcl:",unusedKeyPositions"`
 }
 
@@ -200,6 +231,7 @@ type k8sConfig struct {
 	ContainerHelper            ContainerHelper
 	sigstoreConfig             *sigstore.Config
 	APIServerCache             k8sAPIServerCacheConfig
+	Broker                     *k8sBrokerConfig
 
 	Client     *kubeletClient
 	LastReload time.Time
@@ -214,6 +246,7 @@ func (p *Plugin) buildConfig(coreConfig catalog.CoreConfig, hclText string, stat
 	}
 
 	pluginconf.ReportUnusedKeys(status, newConfig.UnusedKeyPositions)
+	brokerConfig := buildBrokerConfig(newConfig.Broker, status)
 
 	// Determine max poll attempts with default
 	maxPollAttempts := newConfig.MaxPollAttempts
@@ -298,6 +331,7 @@ func (p *Plugin) buildConfig(coreConfig catalog.CoreConfig, hclText string, stat
 		ContainerHelper:            containerHelper,
 		sigstoreConfig:             sigstoreConfig,
 		APIServerCache:             apiServerCacheConfig,
+		Broker:                     brokerConfig,
 	}
 }
 
@@ -308,6 +342,73 @@ func buildAPIServerCacheConfig(hclConfig *k8sAPIServerCacheHCLConfig, status *pl
 	pluginconf.ReportUnusedKeys(status, hclConfig.UnusedKeyPositions)
 	return k8sAPIServerCacheConfig{
 		Enabled: hclConfig.Enabled,
+	}
+}
+
+type k8sBrokerConfig struct {
+	Brokers map[string]k8sBrokerEntry
+}
+
+type k8sBrokerEntry struct {
+	ID                spiffeid.ID
+	PodReferenceScope podReferenceScope
+}
+
+func buildBrokerConfig(brokerConfig *k8sBrokerHCLConfig, status *pluginconf.Status) *k8sBrokerConfig {
+	if brokerConfig == nil {
+		return nil
+	}
+
+	pluginconf.ReportUnusedKeys(status, brokerConfig.UnusedKeyPositions)
+	if len(brokerConfig.Brokers) == 0 {
+		status.ReportError("broker.brokers: at least one broker is required")
+		return &k8sBrokerConfig{Brokers: map[string]k8sBrokerEntry{}}
+	}
+
+	brokers := make(map[string]k8sBrokerEntry, len(brokerConfig.Brokers))
+	seen := make(map[string]struct{}, len(brokerConfig.Brokers))
+	for i, b := range brokerConfig.Brokers {
+		pluginconf.ReportUnusedKeys(status, b.UnusedKeyPositions)
+		if b.ID == "" {
+			status.ReportErrorf("broker.brokers[%d].id: must be specified", i)
+			continue
+		}
+		if _, dup := seen[b.ID]; dup {
+			status.ReportErrorf("broker.brokers[%s].id: duplicate broker id", b.ID)
+			continue
+		}
+		seen[b.ID] = struct{}{}
+
+		id, err := spiffeid.FromString(b.ID)
+		if err != nil {
+			status.ReportErrorf("broker.brokers[%s].id: %v", b.ID, err)
+			continue
+		}
+
+		podRefScope, ok := buildPodReferenceScope(b.ID, b.PodReferenceScope, status)
+		if !ok {
+			continue
+		}
+
+		brokers[b.ID] = k8sBrokerEntry{
+			ID:                id,
+			PodReferenceScope: podRefScope,
+		}
+	}
+	return &k8sBrokerConfig{Brokers: brokers}
+}
+
+func buildPodReferenceScope(brokerID string, hclValue string, status *pluginconf.Status) (podReferenceScope, bool) {
+	switch hclValue {
+	case "":
+		return podReferenceScopeAgentNode, true
+	case string(podReferenceScopeAgentNode):
+		return podReferenceScopeAgentNode, true
+	case string(podReferenceScopeCluster):
+		return podReferenceScopeCluster, true
+	default:
+		status.ReportErrorf("broker.brokers[%s].pod_reference_scope: unsupported value %q; must be one of [agent_node, cluster]", brokerID, hclValue)
+		return "", false
 	}
 }
 
@@ -357,81 +458,187 @@ func (p *Plugin) SetLogger(log hclog.Logger) {
 }
 
 // Attest implements the legacy PID-only RPC for callers that haven't moved
-// to AttestReference. The shared attestByPID helper produces an
-// AttestReferenceResponse; we reuse its SelectorValues since the response
-// shapes are identical aside from the type name.
+// to AttestReference. PID handling is delegated through AttestReference so the
+// two RPCs share behavior, including broker checks when broker metadata is
+// present on the context.
 func (p *Plugin) Attest(ctx context.Context, req *workloadattestorv1.AttestRequest) (*workloadattestorv1.AttestResponse, error) {
-	resp, err := p.attestByPID(ctx, req.Pid)
+	ref, err := anypb.New(&broker.WorkloadPIDReference{Pid: req.Pid})
 	if err != nil {
 		return nil, err
 	}
-	return &workloadattestorv1.AttestResponse{SelectorValues: resp.SelectorValues}, nil
+	resp, err := p.AttestReference(ctx, &workloadattestorv1.AttestReferenceRequest{Reference: ref})
+	if err != nil {
+		return nil, err
+	}
+	return &workloadattestorv1.AttestResponse{SelectorValues: resp.GetSelectorValues()}, nil
 }
 
 func (p *Plugin) AttestReference(ctx context.Context, req *workloadattestorv1.AttestReferenceRequest) (*workloadattestorv1.AttestReferenceResponse, error) {
-	switch req.Reference.TypeUrl {
+	config, _, _, err := p.getConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	brokerEntry, result, err := p.attestReference(ctx, config, req)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.checkBrokerImpersonationForReference(ctx, brokerEntry, result); err != nil {
+		return nil, err
+	}
+	return result.Response, nil
+}
+
+func (p *Plugin) attestReference(ctx context.Context, config *k8sConfig, req *workloadattestorv1.AttestReferenceRequest) (*k8sBrokerEntry, *attestReferenceResult, error) {
+	reference := req.GetReference()
+	if reference == nil {
+		return nil, nil, status.Error(codes.InvalidArgument, "workload reference must be provided")
+	}
+
+	brokerEntry, err := p.getBrokerEntryIfPresent(ctx, config)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	switch reference.TypeUrl {
 	case workloadPIDReferenceTypeURL:
 		var pidRef broker.WorkloadPIDReference
-		if err := req.Reference.UnmarshalTo(&pidRef); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "unable to unmarshal PID reference: %v", err)
+		if err := reference.UnmarshalTo(&pidRef); err != nil {
+			return nil, nil, status.Errorf(codes.InvalidArgument, "unable to unmarshal PID reference: %v", err)
 		}
-		return p.attestByPID(ctx, pidRef.Pid)
+		result, err := p.attestByPIDReference(ctx, pidRef.Pid)
+		return brokerEntry, result, err
 	case kubernetesObjectReferenceTypeURL:
 		var objRef broker.KubernetesObjectReference
-		// Parse and validate reference.
-		if err := req.Reference.UnmarshalTo(&objRef); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "unable to unmarshal object reference: %v", err)
+		if err := reference.UnmarshalTo(&objRef); err != nil {
+			return nil, nil, status.Errorf(codes.InvalidArgument, "unable to unmarshal object reference: %v", err)
 		}
-		objType := objRef.GetType()
-		if objType == nil {
-			return nil, status.Error(codes.InvalidArgument, "object reference is missing type")
+		if err := validateKubernetesObjectReference(&objRef); err != nil {
+			return nil, nil, err
 		}
-		if objType.Plural == "" {
-			return nil, status.Error(codes.InvalidArgument, "object reference type is missing plural")
-		}
-		if objType.Group == "" {
-			return nil, status.Error(codes.InvalidArgument, "object reference type is missing group")
-		}
-		objKey := objRef.GetKey()
-		if objKey == nil && objRef.GetUid() == "" {
-			return nil, status.Error(codes.InvalidArgument, "object reference is missing key and UID")
-		}
-		if objKey != nil {
-			name := objKey.GetName()
-			if name == "" {
-				return nil, status.Error(codes.InvalidArgument, "object reference key is missing name")
-			}
-		}
-
-		// Attest.
-		switch {
-		// We have special handling for pods.
-		case objType.Plural == "pods" && objType.Group == "core":
-			return p.attestByPodReference(ctx, &objRef)
-		// General case for any other Kubernetes object reference.
-		default:
-			return p.attestByObjectReference(ctx, &objRef)
-		}
+		result, err := p.attestByKubernetesObjectReference(ctx, brokerEntry, &objRef)
+		return brokerEntry, result, err
 	default:
-		return nil, status.Errorf(codes.InvalidArgument, "unsupported reference type: %s", req.Reference.TypeUrl)
+		return nil, nil, status.Errorf(codes.InvalidArgument, "unsupported reference type: %s", reference.TypeUrl)
 	}
 }
 
-func (p *Plugin) attestByPID(ctx context.Context, pid int32) (*workloadattestorv1.AttestReferenceResponse, error) {
-	config, containerHelper, sigstoreVerifier, err := p.getConfig()
+func validateKubernetesObjectReference(objRef *broker.KubernetesObjectReference) error {
+	objType := objRef.GetType()
+	if objType == nil {
+		return status.Error(codes.InvalidArgument, "object reference is missing type")
+	}
+	if objType.Plural == "" {
+		return status.Error(codes.InvalidArgument, "object reference type is missing plural")
+	}
+	if objType.Group == "" {
+		return status.Error(codes.InvalidArgument, "object reference type is missing group")
+	}
+	objKey := objRef.GetKey()
+	if objKey == nil && objRef.GetUid() == "" {
+		return status.Error(codes.InvalidArgument, "object reference is missing key and UID")
+	}
+	if objKey != nil {
+		name := objKey.GetName()
+		if name == "" {
+			return status.Error(codes.InvalidArgument, "object reference key is missing name")
+		}
+	}
+	return nil
+}
+
+type attestReferenceResult struct {
+	Response        *workloadattestorv1.AttestReferenceResponse
+	ObjectReference *broker.KubernetesObjectReference
+	Namespace       string
+	Name            string
+}
+
+func (p *Plugin) attestByPIDReference(ctx context.Context, pid int32) (*attestReferenceResult, error) {
+	resp, pod, err := p.attestByPID(ctx, pid)
 	if err != nil {
 		return nil, err
+	}
+
+	result := &attestReferenceResult{Response: resp}
+	if pod != nil {
+		result.ObjectReference = &broker.KubernetesObjectReference{
+			Type: &broker.KubernetesObjectType{Plural: "pods", Group: "core"},
+		}
+		result.Namespace = pod.Namespace
+		result.Name = pod.Name
+	}
+	return result, nil
+}
+
+func (p *Plugin) attestByKubernetesObjectReference(ctx context.Context, brokerEntry *k8sBrokerEntry, objRef *broker.KubernetesObjectReference) (*attestReferenceResult, error) {
+	objType := objRef.GetType()
+	switch {
+	case objType.Plural == "pods" && objType.Group == "core":
+		return p.attestByPodReference(ctx, brokerEntry, objRef)
+	default:
+		return p.attestByObjectReference(ctx, objRef)
+	}
+}
+
+func (p *Plugin) checkBrokerImpersonationForReference(ctx context.Context, brokerEntry *k8sBrokerEntry, result *attestReferenceResult) error {
+	if brokerEntry == nil {
+		return nil
+	}
+	if result.ObjectReference == nil {
+		return nil
+	}
+	kubeClient, err := p.getOrCreateKubeClient(ctx)
+	if err != nil {
+		return status.Errorf(codes.Internal, "unable to set up Kubernetes client: %v", err)
+	}
+	return p.checkBrokerImpersonation(ctx, kubeClient, brokerEntry, result.ObjectReference, result.Namespace, result.Name)
+}
+
+func (p *Plugin) getBrokerEntryIfPresent(ctx context.Context, config *k8sConfig) (*k8sBrokerEntry, error) {
+	_, ok, err := brokercontext.CallerIDFromContext(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "unable to determine broker caller identity: %v", err)
+	}
+	if !ok {
+		return nil, nil
+	}
+	return p.getBrokerEntry(ctx, config)
+}
+
+func (p *Plugin) getBrokerEntry(ctx context.Context, config *k8sConfig) (*k8sBrokerEntry, error) {
+	if config.Broker == nil {
+		return nil, status.Error(codes.Internal, "broker configuration missing")
+	}
+	callerID, ok, err := brokercontext.CallerIDFromContext(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "unable to determine broker caller identity: %v", err)
+	}
+	if !ok {
+		return nil, status.Error(codes.Internal, "broker caller identity missing")
+	}
+	brokerEntry, ok := config.Broker.Brokers[callerID.String()]
+	if !ok {
+		return nil, status.Errorf(codes.PermissionDenied, "broker %q is not configured", callerID.String())
+	}
+	return &brokerEntry, nil
+}
+
+func (p *Plugin) attestByPID(ctx context.Context, pid int32) (*workloadattestorv1.AttestReferenceResponse, *corev1.Pod, error) {
+	config, containerHelper, sigstoreVerifier, err := p.getConfig()
+	if err != nil {
+		return nil, nil, err
 	}
 
 	podUID, containerID, err := containerHelper.GetPodUIDAndContainerID(pid, p.log)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	podKnown := podUID != ""
 
 	// Not a Kubernetes pod
 	if containerID == "" {
-		return &workloadattestorv1.AttestReferenceResponse{}, nil
+		return &workloadattestorv1.AttestReferenceResponse{}, nil, nil
 	}
 
 	log := p.log.With(
@@ -447,10 +654,11 @@ func (p *Plugin) attestByPID(ctx context.Context, pid int32) (*workloadattestorv
 
 		podList, err := p.getPodList(ctx, config.Client, config.PollRetryInterval/2)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		var attestResponse *workloadattestorv1.AttestReferenceResponse
+		var attestedPod *corev1.Pod
 		for podKey, podValue := range podList {
 			if podKnown {
 				if podKey != string(podUID) {
@@ -465,7 +673,7 @@ func (p *Plugin) attestByPID(ctx context.Context, pid int32) (*workloadattestorv
 
 			pod := new(corev1.Pod)
 			if err := json.Unmarshal(scratch, &pod); err != nil {
-				return nil, status.Errorf(codes.Internal, "unable to decode pod info from kubelet response: %v", err)
+				return nil, nil, status.Errorf(codes.Internal, "unable to decode pod info from kubelet response: %v", err)
 			}
 
 			var selectorValues []string
@@ -485,7 +693,7 @@ func (p *Plugin) attestByPID(ctx context.Context, pid int32) (*workloadattestorv
 					log.Debug("Attempting to verify sigstore image signature", "image", containerStatus.Image)
 					sigstoreSelectors, err := p.sigstoreVerifier.Verify(ctx, containerStatus.ImageID)
 					if err != nil {
-						return nil, status.Errorf(codes.Internal, "error verifying sigstore image signature for imageID %s: %v", containerStatus.ImageID, err)
+						return nil, nil, status.Errorf(codes.Internal, "error verifying sigstore image signature for imageID %s: %v", containerStatus.ImageID, err)
 					}
 					selectorValues = append(selectorValues, sigstoreSelectors...)
 				}
@@ -500,20 +708,21 @@ func (p *Plugin) attestByPID(ctx context.Context, pid int32) (*workloadattestorv
 			if len(selectorValues) > 0 {
 				if attestResponse != nil {
 					log.Warn("Two pods found with same container Id")
-					return nil, status.Error(codes.Internal, "two pods found with same container Id")
+					return nil, nil, status.Error(codes.Internal, "two pods found with same container Id")
 				}
 				attestResponse = &workloadattestorv1.AttestReferenceResponse{SelectorValues: selectorValues}
+				attestedPod = pod
 			}
 		}
 
 		if attestResponse != nil {
-			return attestResponse, nil
+			return attestResponse, attestedPod, nil
 		}
 
 		// if the container was not located after the maximum number of attempts then the search is over.
 		if attempt >= config.MaxPollAttempts {
 			log.Warn("Container id not found; giving up")
-			return nil, status.Error(codes.DeadlineExceeded, "no selectors found after max poll attempts")
+			return nil, nil, status.Error(codes.DeadlineExceeded, "no selectors found after max poll attempts")
 		}
 
 		// wait a bit for containers to initialize before trying again.
@@ -522,7 +731,7 @@ func (p *Plugin) attestByPID(ctx context.Context, pid int32) (*workloadattestorv
 		select {
 		case <-p.clock.After(config.PollRetryInterval):
 		case <-ctx.Done():
-			return nil, status.Errorf(codes.Canceled, "no selectors found: %v", ctx.Err())
+			return nil, nil, status.Errorf(codes.Canceled, "no selectors found: %v", ctx.Err())
 		}
 	}
 }
@@ -535,12 +744,13 @@ func (p *Plugin) attestByPID(ctx context.Context, pid int32) (*workloadattestorv
 // ("if both key and uid are supplied, the resolved pod's UID MUST match the
 // supplied uid"). Resolution tries the kubelet pod list first (cheap,
 // node-local, indexed by UID — same path the legacy PID flow uses), then
-// falls back to the API server. Selector emission uses the pod-shaped
-// vocabulary (sa, ns, pod-uid, pod-name, pod-image, pod-label, pod-owner,
-// ...) — distinct from the generic-object vocabulary so registration entries
+// falls back to the API server when needed. Under agent_node scope, API
+// server results must still match the agent node name. Selector emission uses pod-shaped selectors
+// (sa, ns, pod-uid, pod-name, pod-image, pod-label, pod-owner, ...), distinct
+// from the generic-object vocabulary so registration entries
 // can match pod-specific fields like container images and service accounts
 // that aren't present on a PartialObjectMetadata.
-func (p *Plugin) attestByPodReference(ctx context.Context, objRef *broker.KubernetesObjectReference) (*workloadattestorv1.AttestReferenceResponse, error) {
+func (p *Plugin) attestByPodReference(ctx context.Context, brokerEntry *k8sBrokerEntry, objRef *broker.KubernetesObjectReference) (*attestReferenceResult, error) {
 	key := objRef.GetKey()
 	namespace := key.GetNamespace()
 	name := key.GetName()
@@ -557,9 +767,9 @@ func (p *Plugin) attestByPodReference(ctx context.Context, objRef *broker.Kubern
 		if namespace == "" {
 			return nil, ErrNamespaceRequired
 		}
-		pod, err = p.findPodByName(ctx, config, namespace, name)
+		pod, err = p.findPodByName(ctx, config, namespace, name, brokerPodReferenceScope(brokerEntry))
 	default:
-		pod, err = p.findPodByUID(ctx, config, uid)
+		pod, err = p.findPodByUID(ctx, config, uid, brokerPodReferenceScope(brokerEntry))
 	}
 	if err != nil {
 		return nil, err
@@ -571,17 +781,29 @@ func (p *Plugin) attestByPodReference(ctx context.Context, objRef *broker.Kubern
 		return nil, status.Errorf(codes.NotFound, "pod %s/%s has UID %s, expected %s", pod.Namespace, pod.Name, pod.UID, uid)
 	}
 
-	return &workloadattestorv1.AttestReferenceResponse{SelectorValues: getSelectorValuesFromPodInfo(pod)}, nil
+	return &attestReferenceResult{
+		Response:        &workloadattestorv1.AttestReferenceResponse{SelectorValues: getSelectorValuesFromPodInfo(pod)},
+		ObjectReference: objRef,
+		Namespace:       pod.Namespace,
+		Name:            pod.Name,
+	}, nil
+}
+
+func brokerPodReferenceScope(brokerEntry *k8sBrokerEntry) podReferenceScope {
+	if brokerEntry == nil {
+		return podReferenceScopeAgentNode
+	}
+	return brokerEntry.PodReferenceScope
 }
 
 // findPodByName resolves a single pod by its namespaced name. The kubelet
 // pod list is iterated first; this is O(n) over the node's pods (the list
 // is indexed by UID, not name) but n is small in practice and saves an API
-// server round-trip when the pod is local. If the pod isn't on this node
-// the apiserver answers a precise Get directly — no list, no client-side
-// filter — and `apierrors.IsNotFound` is mapped to `codes.NotFound` so
-// callers can distinguish "no such pod" from a transport error.
-func (p *Plugin) findPodByName(ctx context.Context, config *k8sConfig, namespace, name string) (*corev1.Pod, error) {
+// server round-trip when the pod is local. If the pod is not in the kubelet
+// list, the apiserver answers a precise Get directly — no list, no
+// client-side filter. Under agent_node scope, the resolved pod must still be
+// scheduled to the configured agent node.
+func (p *Plugin) findPodByName(ctx context.Context, config *k8sConfig, namespace, name string, scope podReferenceScope) (*corev1.Pod, error) {
 	// Try kubelet pod list first; iterate to find a match by namespace+name.
 	podList, err := p.getPodList(ctx, config.Client, config.PollRetryInterval/2)
 	if err != nil {
@@ -609,17 +831,20 @@ func (p *Plugin) findPodByName(ctx context.Context, config *k8sConfig, namespace
 		}
 		return nil, status.Errorf(codes.Internal, "unable to get pod from Kubernetes API: %v", err)
 	}
+	if err := checkPodReferenceScope(scope, config.NodeName, pod); err != nil {
+		return nil, err
+	}
 	return pod, nil
 }
 
 // findPodByUID resolves a single pod by its Kubernetes UID. The kubelet pod
 // list is checked first because it's already keyed by UID and only contains
-// pods scheduled to this node — both common-case wins. If the pod isn't on
-// this node, it falls back to a cluster-wide List from the API server, which
-// is unavoidable because Kubernetes does not support `metadata.uid` as a
-// field selector (the apiserver would not be able to push the filter down,
-// so we list and filter client-side regardless).
-func (p *Plugin) findPodByUID(ctx context.Context, config *k8sConfig, uid types.UID) (*corev1.Pod, error) {
+// pods scheduled to this node — both common-case wins. If the pod is not in
+// the kubelet list, it falls back to a cluster-wide List from the API server.
+// Kubernetes does not support `metadata.uid` as a field selector, so we list
+// and filter client-side regardless. Under agent_node scope, the resolved pod
+// must still be scheduled to the configured agent node.
+func (p *Plugin) findPodByUID(ctx context.Context, config *k8sConfig, uid types.UID, scope podReferenceScope) (*corev1.Pod, error) {
 	// Try kubelet pod list first (already indexed by UID).
 	podList, err := p.getPodList(ctx, config.Client, config.PollRetryInterval/2)
 	if err != nil {
@@ -640,11 +865,28 @@ func (p *Plugin) findPodByUID(ctx context.Context, config *k8sConfig, uid types.
 		return nil, status.Errorf(codes.Internal, "unable to list pods from Kubernetes API: %v", err)
 	}
 	for i := range pods.Items {
-		if pods.Items[i].UID == uid {
-			return &pods.Items[i], nil
+		if pods.Items[i].UID != uid {
+			continue
 		}
+		if err := checkPodReferenceScope(scope, config.NodeName, &pods.Items[i]); err != nil {
+			return nil, err
+		}
+		return &pods.Items[i], nil
 	}
 	return nil, status.Errorf(codes.NotFound, "pod with UID %s not found", uid)
+}
+
+func checkPodReferenceScope(scope podReferenceScope, agentNodeName string, pod *corev1.Pod) error {
+	if scope != podReferenceScopeAgentNode {
+		return nil
+	}
+	if agentNodeName == "" {
+		return status.Error(codes.Internal, "agent node name is not configured")
+	}
+	if pod.Spec.NodeName != agentNodeName {
+		return status.Error(codes.PermissionDenied, "pod is not on the agent node")
+	}
+	return nil
 }
 
 // decodePodFromKubelet rehydrates a `corev1.Pod` from the partially-parsed
@@ -668,7 +910,7 @@ func decodePodFromKubelet(podValue *fastjson.Value) (*corev1.Pod, error) {
 // via the discovery-backed REST mapper, fetches the object's metadata via
 // PartialObjectMetadata, and emits a uniform set of selectors derived from
 // `ObjectMeta` (resource, namespace, name, uid, labels, owner references).
-func (p *Plugin) attestByObjectReference(ctx context.Context, objRef *broker.KubernetesObjectReference) (*workloadattestorv1.AttestReferenceResponse, error) {
+func (p *Plugin) attestByObjectReference(ctx context.Context, objRef *broker.KubernetesObjectReference) (*attestReferenceResult, error) {
 	r := objRef.GetType()
 	key := objRef.GetKey()
 	namespace := key.GetNamespace()
@@ -684,10 +926,7 @@ func (p *Plugin) attestByObjectReference(ctx context.Context, objRef *broker.Kub
 	// Per the SPIFFE Broker API spec, `core` is the canonical group string
 	// for the Kubernetes core API group, but Kubernetes itself uses the
 	// empty string on the wire — translate before mapping.
-	group := r.GetGroup()
-	if group == "core" {
-		group = ""
-	}
+	group := kubernetesAPIGroup(r.GetGroup())
 	gvr := schema.GroupVersionResource{Group: group, Resource: r.GetPlural()}
 	gvk, err := mapper.KindFor(gvr)
 	if err != nil {
@@ -715,10 +954,45 @@ func (p *Plugin) attestByObjectReference(ctx context.Context, objRef *broker.Kub
 		return nil, status.Errorf(codes.NotFound, "%s.%s %s/%s has UID %s, expected %s",
 			r.GetPlural(), r.GetGroup(), obj.Namespace, obj.Name, obj.UID, uid)
 	}
-
-	return &workloadattestorv1.AttestReferenceResponse{
-		SelectorValues: getSelectorValuesFromObjectMeta(r, gvk, obj),
+	return &attestReferenceResult{
+		Response: &workloadattestorv1.AttestReferenceResponse{
+			SelectorValues: getSelectorValuesFromObjectMeta(r, gvk, obj),
+		},
+		ObjectReference: objRef,
+		Namespace:       obj.Namespace,
+		Name:            obj.Name,
 	}, nil
+}
+
+// checkBrokerImpersonation asks the Kubernetes authorizer whether the broker
+// SPIFFE ID may use SPIRE's custom verb on the referenced object.
+func (p *Plugin) checkBrokerImpersonation(ctx context.Context, kubeClient client.Client, brokerEntry *k8sBrokerEntry, objRef *broker.KubernetesObjectReference, namespace, name string) error {
+	review := &authv1.SubjectAccessReview{
+		Spec: authv1.SubjectAccessReviewSpec{
+			User: brokerEntry.ID.String(),
+			ResourceAttributes: &authv1.ResourceAttributes{
+				Group:     kubernetesAPIGroup(objRef.GetType().GetGroup()),
+				Resource:  objRef.GetType().GetPlural(),
+				Namespace: namespace,
+				Name:      name,
+				Verb:      brokerImpersonationReviewVerb,
+			},
+		},
+	}
+	if err := kubeClient.Create(ctx, review); err != nil {
+		return status.Errorf(codes.Internal, "unable to check Kubernetes authorization for broker: %v", err)
+	}
+	if !review.Status.Allowed {
+		return status.Error(codes.PermissionDenied, "Kubernetes authorizer does not allow the broker to use impersonate-via-spire for the referenced object")
+	}
+	return nil
+}
+
+func kubernetesAPIGroup(group string) string {
+	if group == "core" {
+		return ""
+	}
+	return group
 }
 
 // findObject resolves a single Kubernetes object's metadata. When `name` is

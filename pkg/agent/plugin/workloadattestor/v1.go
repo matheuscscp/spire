@@ -7,6 +7,7 @@ import (
 
 	"github.com/spiffe/go-spiffe/v2/exp/proto/spiffe/broker"
 	workloadattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/agent/workloadattestor/v1"
+	"github.com/spiffe/spire/pkg/agent/broker/brokercontext"
 	"github.com/spiffe/spire/pkg/common/plugin"
 	"github.com/spiffe/spire/pkg/common/util"
 	"github.com/spiffe/spire/proto/spire/common"
@@ -82,6 +83,7 @@ func (v1 *V1) attestByPID(ctx context.Context, pid int32) ([]*common.Selector, e
 
 // attestByReference is the raw plugin call without fallback.
 func (v1 *V1) attestByReference(ctx context.Context, ref *anypb.Any) ([]*common.Selector, error) {
+	ctx = brokercontext.AppendCallerIDToOutgoingContext(ctx)
 	resp, err := v1.WorkloadAttestorPluginClient.AttestReference(ctx, &workloadattestorv1.AttestReferenceRequest{
 		Reference: ref,
 	})
