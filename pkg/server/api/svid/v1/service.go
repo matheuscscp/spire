@@ -206,15 +206,19 @@ func (s *Service) BatchNewX509SVID(ctx context.Context, req *svidv1.BatchNewX509
 	}
 
 	// Fetch authorized entries
-	entriesMap, err := s.findEntries(ctx, log, requestedEntries)
+	callerID, entriesMap, err := s.findEntries(ctx, log, requestedEntries)
 	if err != nil {
 		return nil, err
+	}
+	agentNodeName, err := s.callerAgentNodeName(ctx, callerID)
+	if err != nil {
+		return nil, api.MakeErr(log, codes.Internal, "failed to fetch agent node name", err)
 	}
 
 	var results []*svidv1.BatchNewX509SVIDResponse_Result
 	for _, svidParam := range req.Params {
 		//  Create new SVID
-		r := s.newX509SVID(ctx, svidParam, entriesMap)
+		r := s.newX509SVID(ctx, svidParam, entriesMap, agentNodeName)
 		results = append(results, r)
 		spiffeID := ""
 		if r.Svid != nil {
@@ -242,21 +246,21 @@ func (s *Service) BatchNewX509SVID(ctx context.Context, req *svidv1.BatchNewX509
 	return &svidv1.BatchNewX509SVIDResponse{Results: results}, nil
 }
 
-func (s *Service) findEntries(ctx context.Context, log logrus.FieldLogger, entries map[string]struct{}) (map[string]api.ReadOnlyEntry, error) {
+func (s *Service) findEntries(ctx context.Context, log logrus.FieldLogger, entries map[string]struct{}) (spiffeid.ID, map[string]api.ReadOnlyEntry, error) {
 	callerID, ok := rpccontext.CallerID(ctx)
 	if !ok {
-		return nil, api.MakeErr(log, codes.Internal, "caller ID missing from request context", nil)
+		return spiffeid.ID{}, nil, api.MakeErr(log, codes.Internal, "caller ID missing from request context", nil)
 	}
 
 	foundEntries, err := s.ef.LookupAuthorizedEntries(ctx, callerID, entries)
 	if err != nil {
-		return nil, api.MakeErr(log, codes.Internal, "failed to fetch registration entries", err)
+		return spiffeid.ID{}, nil, api.MakeErr(log, codes.Internal, "failed to fetch registration entries", err)
 	}
-	return foundEntries, nil
+	return callerID, foundEntries, nil
 }
 
 // newX509SVID creates an X509-SVID using data from registration entry and key from CSR
-func (s *Service) newX509SVID(ctx context.Context, param *svidv1.NewX509SVIDParams, entries map[string]api.ReadOnlyEntry) *svidv1.BatchNewX509SVIDResponse_Result {
+func (s *Service) newX509SVID(ctx context.Context, param *svidv1.NewX509SVIDParams, entries map[string]api.ReadOnlyEntry, agentNodeName string) *svidv1.BatchNewX509SVIDResponse_Result {
 	log := rpccontext.Logger(ctx)
 
 	switch {
@@ -302,10 +306,11 @@ func (s *Service) newX509SVID(ctx context.Context, param *svidv1.NewX509SVIDPara
 	log = log.WithField(telemetry.SPIFFEID, spiffeID.String())
 
 	x509Svid, err := s.ca.SignWorkloadX509SVID(ctx, ca.WorkloadX509SVIDParams{
-		SPIFFEID:  spiffeID,
-		PublicKey: csr.PublicKey,
-		DNSNames:  entry.GetDnsNames(),
-		TTL:       time.Duration(entry.GetX509SvidTtl()) * time.Second,
+		SPIFFEID:      spiffeID,
+		PublicKey:     csr.PublicKey,
+		AgentNodeName: agentNodeName,
+		DNSNames:      entry.GetDnsNames(),
+		TTL:           time.Duration(entry.GetX509SvidTtl()) * time.Second,
 	})
 	if err != nil {
 		return &svidv1.BatchNewX509SVIDResponse_Result{
@@ -393,7 +398,7 @@ func (s *Service) NewJWTSVID(ctx context.Context, req *svidv1.NewJWTSVIDRequest)
 	}
 
 	// Fetch authorized entries
-	entriesMap, err := s.findEntries(ctx, log, entries)
+	_, entriesMap, err := s.findEntries(ctx, log, entries)
 	if err != nil {
 		return nil, err
 	}
@@ -437,7 +442,7 @@ func (s *Service) BatchNewWITSVID(ctx context.Context, req *svidv1.BatchNewWITSV
 	}
 
 	// Fetch authorized entries
-	entriesMap, err := s.findEntries(ctx, log, requestedEntries)
+	_, entriesMap, err := s.findEntries(ctx, log, requestedEntries)
 	if err != nil {
 		return nil, err
 	}

@@ -9,12 +9,23 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-const callerIDMetadataKey = "spire-agent-broker-caller-id"
+const (
+	callerIDMetadataKey       = "spire-agent-broker-caller-id"
+	callerNodeNameMetadataKey = "spire-agent-broker-caller-node-name"
+)
 
 type callerIDKey struct{}
+type callerNodeNameKey struct{}
 
 func WithCallerID(ctx context.Context, id spiffeid.ID) context.Context {
 	return context.WithValue(ctx, callerIDKey{}, id)
+}
+
+func WithCallerNodeName(ctx context.Context, nodeName string) context.Context {
+	if nodeName == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, callerNodeNameKey{}, nodeName)
 }
 
 func CallerIDFromContext(ctx context.Context) (spiffeid.ID, bool, error) {
@@ -41,10 +52,35 @@ func CallerIDFromContext(ctx context.Context) (spiffeid.ID, bool, error) {
 	}
 }
 
-func AppendCallerIDToOutgoingContext(ctx context.Context) context.Context {
-	id, ok := ctx.Value(callerIDKey{}).(spiffeid.ID)
-	if !ok {
-		return ctx
+func CallerNodeNameFromContext(ctx context.Context) (string, bool, error) {
+	if nodeName, ok := ctx.Value(callerNodeNameKey{}).(string); ok {
+		return nodeName, nodeName != "", nil
 	}
-	return metadata.AppendToOutgoingContext(ctx, callerIDMetadataKey, id.String())
+
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return "", false, nil
+	}
+	values := md.Get(callerNodeNameMetadataKey)
+	switch len(values) {
+	case 0:
+		return "", false, nil
+	case 1:
+		if values[0] == "" {
+			return "", false, nil
+		}
+		return values[0], true, nil
+	default:
+		return "", false, errors.New("multiple broker caller node names provided")
+	}
+}
+
+func AppendCallerIDToOutgoingContext(ctx context.Context) context.Context {
+	if id, ok := ctx.Value(callerIDKey{}).(spiffeid.ID); ok {
+		ctx = metadata.AppendToOutgoingContext(ctx, callerIDMetadataKey, id.String())
+	}
+	if nodeName, ok := ctx.Value(callerNodeNameKey{}).(string); ok && nodeName != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, callerNodeNameMetadataKey, nodeName)
+	}
+	return ctx
 }

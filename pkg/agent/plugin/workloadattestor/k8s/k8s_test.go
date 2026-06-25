@@ -732,6 +732,20 @@ func (s *Suite) TestConfigureBroker() {
 			`,
 		},
 		{
+			name: "valid broker node pod reference scope",
+			hcl: `
+				kubelet_read_only_port = 12345
+				broker {
+					brokers = [
+						{
+							id = "spiffe://example.org/broker"
+							pod_reference_scope = "broker_node"
+						}
+					]
+				}
+			`,
+		},
+		{
 			name: "empty brokers",
 			hcl: `
 				kubelet_read_only_port = 12345
@@ -791,7 +805,7 @@ func (s *Suite) TestConfigureBroker() {
 					]
 				}
 			`,
-			expectedErr: `broker.brokers[spiffe://example.org/broker].pod_reference_scope: unsupported value "Cluster"; must be one of [agent_node, cluster]`,
+			expectedErr: `broker.brokers[spiffe://example.org/broker].pod_reference_scope: unsupported value "Cluster"; must be one of [broker_node, cluster]`,
 		},
 	}
 
@@ -1084,6 +1098,14 @@ func testBrokerConfigWithPodReferenceScope(scope string) string {
 }
 
 func testBrokerContext() context.Context {
+	return testBrokerContextWithBrokerNodeName("k8s-node-1")
+}
+
+func testBrokerContextWithBrokerNodeName(nodeName string) context.Context {
+	return brokercontext.WithCallerNodeName(brokercontext.WithCallerID(context.Background(), testBrokerSPIFFEID), nodeName)
+}
+
+func testBrokerContextWithoutBrokerNodeName() context.Context {
 	return brokercontext.WithCallerID(context.Background(), testBrokerSPIFFEID)
 }
 
@@ -1418,7 +1440,7 @@ func (s *Suite) TestAttestReferenceWithPodUID_FoundInKubelet() {
 	s.requireSelectorsEqual(testPodSelectors, selectors)
 }
 
-func (s *Suite) TestAttestReferenceWithPodUID_DefaultScopeFallsBackToAPIServerForAgentNodePod() {
+func (s *Suite) TestAttestReferenceWithPodUID_DefaultScopeFallsBackToAPIServerForBrokerNodePod() {
 	s.startInsecureKubelet()
 
 	// Serve an empty pod list so the kubelet lookup finds nothing.
@@ -1445,7 +1467,7 @@ func (s *Suite) TestAttestReferenceWithPodUID_DefaultScopeFallsBackToAPIServerFo
 	s.requireSelectorsEqual(testPodSelectors, selectors)
 }
 
-func (s *Suite) TestAttestReferenceWithPodUID_DefaultScopeRejectsAPIServerPodOnOtherNode() {
+func (s *Suite) TestAttestReferenceWithPodUID_DefaultScopeRejectsAPIServerPodOnOtherBrokerNode() {
 	s.startInsecureKubelet()
 
 	emptyPodList := []byte(`{"items":[]}`)
@@ -1469,11 +1491,11 @@ func (s *Suite) TestAttestReferenceWithPodUID_DefaultScopeRejectsAPIServerPodOnO
 	s.Require().NoError(err)
 
 	selectors, err := wa.AttestReference(testBrokerContext(), anyRef)
-	s.RequireGRPCStatusContains(err, codes.PermissionDenied, "pod is not on the agent node")
+	s.RequireGRPCStatusContains(err, codes.PermissionDenied, "pod is not on the broker node")
 	s.Require().Nil(selectors)
 }
 
-func (s *Suite) TestAttestReferenceWithPodUID_DefaultScopeRequiresAgentNodeNameForAPIServerFallback() {
+func (s *Suite) TestAttestReferenceWithPodUID_DefaultScopeRequiresBrokerNodeName() {
 	s.startInsecureKubelet()
 
 	emptyPodList := []byte(`{"items":[]}`)
@@ -1493,8 +1515,48 @@ func (s *Suite) TestAttestReferenceWithPodUID_DefaultScopeRequiresAgentNodeNameF
 	anyRef, err := anypb.New(&broker.KubernetesObjectReference{Type: &broker.KubernetesObjectType{Plural: "pods", Group: "core"}, Uid: testPodUID})
 	s.Require().NoError(err)
 
-	selectors, err := wa.AttestReference(testBrokerContext(), anyRef)
-	s.RequireGRPCStatusContains(err, codes.Internal, "agent node name is not configured")
+	selectors, err := wa.AttestReference(testBrokerContextWithoutBrokerNodeName(), anyRef)
+	s.RequireGRPCStatusContains(err, codes.PermissionDenied, "broker X509-SVID is missing broker node name")
+	s.Require().Nil(selectors)
+}
+
+func (s *Suite) TestAttestReferenceWithPodUID_DefaultScopeUsesBrokerNodeName() {
+	s.startInsecureKubelet()
+
+	emptyPodList := []byte(`{"items":[]}`)
+	s.podListMu.Lock()
+	s.podList = append(s.podList, emptyPodList)
+	s.podListMu.Unlock()
+
+	fakeClient := fakeKubeClientWithSubjectAccessReview(true, nil, testAPIServerBlogPod())
+	cfg := fmt.Sprintf(`
+		kubelet_read_only_port = %d
+		max_poll_attempts = 5
+		poll_retry_interval = "1s"
+		node_name = "other-node"
+		%s
+`, s.kubeletPort(), testBrokerConfig())
+	wa := s.loadPluginWithKubeClient(cfg, fakeClient)
+
+	anyRef, err := anypb.New(&broker.KubernetesObjectReference{Type: &broker.KubernetesObjectType{Plural: "pods", Group: "core"}, Uid: testPodUID})
+	s.Require().NoError(err)
+
+	selectors, err := wa.AttestReference(testBrokerContextWithBrokerNodeName("k8s-node-1"), anyRef)
+	s.Require().NoError(err)
+	s.requireSelectorsEqual(testPodSelectors, selectors)
+}
+
+func (s *Suite) TestAttestReferenceWithPodUID_DefaultScopeRejectsKubeletPodOnOtherBrokerNode() {
+	s.startInsecureKubelet()
+	p := s.loadInsecurePluginWithBrokerAndKubeClient(fakeKubeClientWithSubjectAccessReview(true, nil))
+
+	s.addPodListResponse(podListFilePath)
+
+	anyRef, err := anypb.New(&broker.KubernetesObjectReference{Type: &broker.KubernetesObjectType{Plural: "pods", Group: "core"}, Uid: testPodUID})
+	s.Require().NoError(err)
+
+	selectors, err := p.AttestReference(testBrokerContextWithBrokerNodeName("other-node"), anyRef)
+	s.RequireGRPCStatusContains(err, codes.PermissionDenied, "pod is not on the broker node")
 	s.Require().Nil(selectors)
 }
 

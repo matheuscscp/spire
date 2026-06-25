@@ -117,7 +117,18 @@ func isTCPCaller(ctx context.Context) bool {
 	return tcp
 }
 
-func (s *Service) getCallerContext(ctx context.Context) (spiffeid.ID, error) {
+type callerContext struct {
+	id            spiffeid.ID
+	agentNodeName string
+}
+
+func (c callerContext) withContext(ctx context.Context) context.Context {
+	ctx = brokercontext.WithCallerID(ctx, c.id)
+	ctx = brokercontext.WithCallerNodeName(ctx, c.agentNodeName)
+	return ctx
+}
+
+func (s *Service) getCallerContext(ctx context.Context) (callerContext, error) {
 	// The broker endpoint configures the gRPC server with plain
 	// credentials.NewTLS (to keep SessionTicketsDisabled and TLS policy
 	// customizations on the *tls.Config). That credentials wrapper exposes
@@ -125,17 +136,25 @@ func (s *Service) getCallerContext(ctx context.Context) (spiffeid.ID, error) {
 	// grpccredentials authInfo, so we extract it ourselves here.
 	p, ok := peer.FromContext(ctx)
 	if !ok || p.AuthInfo == nil {
-		return spiffeid.ID{}, status.Error(codes.Unauthenticated, "unable to determine caller identity")
+		return callerContext{}, status.Error(codes.Unauthenticated, "unable to determine caller identity")
 	}
 	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
 	if !ok || tlsInfo.SPIFFEID == nil {
-		return spiffeid.ID{}, status.Error(codes.Unauthenticated, "unable to determine caller identity")
+		return callerContext{}, status.Error(codes.Unauthenticated, "unable to determine caller identity")
 	}
 	id, err := spiffeid.FromString(tlsInfo.SPIFFEID.String())
 	if err != nil {
-		return spiffeid.ID{}, status.Errorf(codes.Unauthenticated, "invalid caller SPIFFE ID: %v", err)
+		return callerContext{}, status.Errorf(codes.Unauthenticated, "invalid caller SPIFFE ID: %v", err)
 	}
-	return id, nil
+
+	var agentNodeName string
+	if len(tlsInfo.State.PeerCertificates) > 0 {
+		agentNodeName, _, err = x509util.AgentNodeNameFromCertificate(tlsInfo.State.PeerCertificates[0])
+		if err != nil {
+			return callerContext{}, status.Errorf(codes.Unauthenticated, "invalid caller agent node name extension: %v", err)
+		}
+	}
+	return callerContext{id: id, agentNodeName: agentNodeName}, nil
 }
 
 func (s *Service) SubscribeToX509SVID(req *broker.SubscribeToX509SVIDRequest, stream broker.API_SubscribeToX509SVIDServer) error {
@@ -148,13 +167,13 @@ func (s *Service) SubscribeToX509SVID(req *broker.SubscribeToX509SVIDRequest, st
 	if err != nil {
 		return err
 	}
-	log = log.WithField("broker_peer", peer.String())
+	log = log.WithField("broker_peer", peer.id.String())
 
-	if err := s.authorizeReferenceType(ctx, peer, req.GetReference().GetReference()); err != nil {
+	if err := s.authorizeReferenceType(ctx, peer.id, req.GetReference().GetReference()); err != nil {
 		return err
 	}
 
-	selectors, err := s.constructValidSelectorsFromReference(brokercontext.WithCallerID(ctx, peer), log, req.Reference)
+	selectors, err := s.constructValidSelectorsFromReference(peer.withContext(ctx), log, req.Reference)
 	if err != nil {
 		return err
 	}
@@ -195,16 +214,16 @@ func (s *Service) SubscribeToX509Bundles(req *broker.SubscribeToX509BundlesReque
 	if err != nil {
 		return err
 	}
-	log = log.WithField("broker_peer", peer.String())
+	log = log.WithField("broker_peer", peer.id.String())
 
-	if err := s.authorizeReferenceType(ctx, peer, req.GetReference().GetReference()); err != nil {
+	if err := s.authorizeReferenceType(ctx, peer.id, req.GetReference().GetReference()); err != nil {
 		return err
 	}
 
 	// The bundle response is workload-independent, but per the SPIFFE Broker
 	// API spec the request still identifies a workload. Validate the reference
 	// resolves so a caller can't pull bundles for workloads it can't attest.
-	if _, err := s.constructValidSelectorsFromReference(brokercontext.WithCallerID(ctx, peer), log, req.Reference); err != nil {
+	if _, err := s.constructValidSelectorsFromReference(peer.withContext(ctx), log, req.Reference); err != nil {
 		return err
 	}
 
@@ -248,13 +267,13 @@ func (s *Service) FetchJWTSVID(ctx context.Context, req *broker.FetchJWTSVIDRequ
 	if err != nil {
 		return nil, err
 	}
-	log = log.WithField("broker_peer", peer.String())
+	log = log.WithField("broker_peer", peer.id.String())
 
-	if err := s.authorizeReferenceType(ctx, peer, req.GetReference().GetReference()); err != nil {
+	if err := s.authorizeReferenceType(ctx, peer.id, req.GetReference().GetReference()); err != nil {
 		return nil, err
 	}
 
-	selectors, err := s.constructValidSelectorsFromReference(brokercontext.WithCallerID(ctx, peer), log, req.Reference)
+	selectors, err := s.constructValidSelectorsFromReference(peer.withContext(ctx), log, req.Reference)
 	if err != nil {
 		return nil, err
 	}
@@ -303,16 +322,16 @@ func (s *Service) SubscribeToJWTBundles(req *broker.SubscribeToJWTBundlesRequest
 	if err != nil {
 		return err
 	}
-	log = log.WithField("broker_peer", peer.String())
+	log = log.WithField("broker_peer", peer.id.String())
 
-	if err := s.authorizeReferenceType(ctx, peer, req.GetReference().GetReference()); err != nil {
+	if err := s.authorizeReferenceType(ctx, peer.id, req.GetReference().GetReference()); err != nil {
 		return err
 	}
 
 	// The bundle response is workload-independent, but per the SPIFFE Broker
 	// API spec the request still identifies a workload. Validate the reference
 	// resolves so a caller can't pull bundles for workloads it can't attest.
-	if _, err := s.constructValidSelectorsFromReference(brokercontext.WithCallerID(ctx, peer), log, req.Reference); err != nil {
+	if _, err := s.constructValidSelectorsFromReference(peer.withContext(ctx), log, req.Reference); err != nil {
 		return err
 	}
 

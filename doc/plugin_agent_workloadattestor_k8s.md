@@ -135,8 +135,9 @@ requests for `WorkloadPIDReference` and `KubernetesObjectReference`.
 `AttestReference` requires a `broker` block in the plugin configuration. Each
 `broker.brokers` entry identifies one broker SPIFFE ID that may use this
 plugin. Broker IDs must be valid, unique, and non-empty. Each broker may set
-`pod_reference_scope` to `agent_node` (default) or `cluster`; this only affects
-pod `KubernetesObjectReference` resolution.
+`pod_reference_scope` to `broker_node` (default) or `cluster`; this only affects
+pod `KubernetesObjectReference` resolution. `broker_node` compares the resolved
+pod's `spec.nodeName` with the node name embedded in the broker X509-SVID.
 
 Example:
 
@@ -169,9 +170,10 @@ its resource (`<plural>.<group>`, with `core` as the group string for core
 resources) and either its namespaced name (`namespace` + `name`), its `uid`,
 or both. Pod references try the local kubelet pod list first, then may fall
 back to the Kubernetes API server. With the default
-`pod_reference_scope = "agent_node"`, API server results are accepted only
-when the resolved pod's `spec.nodeName` matches the agent node name from
-`node_name` or `node_name_env`. With `pod_reference_scope = "cluster"`, pod
+`pod_reference_scope = "broker_node"`, results are accepted only when the
+resolved pod's `spec.nodeName` matches the node name embedded in the broker
+X509-SVID. The local agent's configured `node_name`/`node_name_env` is not used
+for this broker scope check. With `pod_reference_scope = "cluster"`, pod
 references may resolve to pods on any node. Non-pod object references are
 resolved through the Kubernetes API server. The plugin then creates the same
 `SubjectAccessReview` for the referenced object. The review uses the broker
@@ -186,8 +188,8 @@ through the same pod-resolution path as the legacy PID reference and emits
 the **same** pod-shaped selectors documented in the table above
 (`k8s:ns`, `k8s:sa`, `k8s:pod-name`, `k8s:container-name`, `k8s:pod-uid`,
 `k8s:pod-label`, `k8s:pod-image`, `k8s:pod-owner`, ...). By default, broker
-pod references are limited to pods scheduled to the agent's node
-(`agent_node`), even when the pod is resolved through the Kubernetes API
+pod references are limited to pods scheduled to the broker's node
+(`broker_node`), even when the pod is resolved through the Kubernetes API
 server. Set `pod_reference_scope = "cluster"` for a broker that must
 reference pods on other nodes. A registration entry written for the legacy
 PID flow continues to match either reference type.

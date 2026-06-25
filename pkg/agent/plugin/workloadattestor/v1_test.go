@@ -50,15 +50,18 @@ func TestV1(t *testing.T) {
 	})
 }
 
-func TestV1AttestReferencePropagatesBrokerCallerID(t *testing.T) {
+func TestV1AttestReferencePropagatesBrokerCallerContext(t *testing.T) {
 	expectedID := spiffeid.RequireFromString("spiffe://example.org/broker")
-	fake := &fakeReferencePluginV1{expectedID: expectedID}
+	expectedNodeName := "k8s-node-1"
+	fake := &fakeReferencePluginV1{expectedID: expectedID, expectedNodeName: expectedNodeName}
 	plugin := new(workloadattestor.V1)
 	plugintest.Load(t, catalog.MakeBuiltIn("test", workloadattestorv1.WorkloadAttestorPluginServer(fake)), plugin)
 
-	selectors, err := plugin.AttestReference(brokercontext.WithCallerID(context.Background(), expectedID), &anypb.Any{TypeUrl: "test"})
+	ctx := brokercontext.WithCallerID(context.Background(), expectedID)
+	ctx = brokercontext.WithCallerNodeName(ctx, expectedNodeName)
+	selectors, err := plugin.AttestReference(ctx, &anypb.Any{TypeUrl: "test"})
 	require.NoError(t, err)
-	spiretest.RequireProtoListEqual(t, []*common.Selector{{Type: "test", Value: "broker-id-ok"}}, selectors)
+	spiretest.RequireProtoListEqual(t, []*common.Selector{{Type: "test", Value: "broker-context-ok"}}, selectors)
 }
 
 func makeFakeV1Plugin(t *testing.T, selectorValues map[int][]string) workloadattestor.WorkloadAttestor {
@@ -89,7 +92,8 @@ func (plugin fakePluginV1) Attest(_ context.Context, req *workloadattestorv1.Att
 
 type fakeReferencePluginV1 struct {
 	workloadattestorv1.UnimplementedWorkloadAttestorServer
-	expectedID spiffeid.ID
+	expectedID       spiffeid.ID
+	expectedNodeName string
 }
 
 func (plugin *fakeReferencePluginV1) AttestReference(ctx context.Context, _ *workloadattestorv1.AttestReferenceRequest) (*workloadattestorv1.AttestReferenceResponse, error) {
@@ -103,5 +107,15 @@ func (plugin *fakeReferencePluginV1) AttestReference(ctx context.Context, _ *wor
 	if actualID != plugin.expectedID {
 		return nil, status.Errorf(codes.Internal, "got broker caller %q", actualID.String())
 	}
-	return &workloadattestorv1.AttestReferenceResponse{SelectorValues: []string{"broker-id-ok"}}, nil
+	actualNodeName, ok, err := brokercontext.CallerNodeNameFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, status.Error(codes.Internal, "missing broker caller node name")
+	}
+	if actualNodeName != plugin.expectedNodeName {
+		return nil, status.Errorf(codes.Internal, "got broker caller node name %q", actualNodeName)
+	}
+	return &workloadattestorv1.AttestReferenceResponse{SelectorValues: []string{"broker-context-ok"}}, nil
 }

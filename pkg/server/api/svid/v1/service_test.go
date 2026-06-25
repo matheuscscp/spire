@@ -2224,6 +2224,46 @@ func TestServiceBatchNewX509SVID(t *testing.T) {
 	}
 }
 
+func TestServiceBatchNewX509SVIDAddsAgentNodeName(t *testing.T) {
+	test := setupServiceTest(t)
+	defer test.Cleanup()
+
+	workloadEntry := &types.Entry{
+		Id:       "workload",
+		ParentId: api.ProtoFromID(agentID),
+		SpiffeId: &types.SPIFFEID{TrustDomain: "example.org", Path: "/workload1"},
+	}
+	test.ef.entries = []*types.Entry{workloadEntry}
+	test.withCallerID = true
+	test.rateLimiter.count = 1
+
+	ctx := context.Background()
+	require.NoError(t, test.ds.SetNodeSelectors(ctx, agentID.String(), []*common.Selector{
+		{Type: "k8s_psat", Value: "agent_node_name:k8s-node-1"},
+	}))
+
+	resp, err := test.client.BatchNewX509SVID(ctx, &svidv1.BatchNewX509SVIDRequest{
+		Params: []*svidv1.NewX509SVIDParams{
+			{
+				EntryId: workloadEntry.Id,
+				Csr:     createCSR(t, &x509.CertificateRequest{}),
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Results, 1)
+	require.Equal(t, int32(codes.OK), resp.Results[0].Status.Code)
+
+	certChain, err := x509util.RawCertsToCertificates(resp.Results[0].Svid.CertChain)
+	require.NoError(t, err)
+	require.NotEmpty(t, certChain)
+
+	nodeName, found, err := x509util.AgentNodeNameFromCertificate(certChain[0])
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "k8s-node-1", nodeName)
+}
+
 func BatchNewWITSVID(t *testing.T) {
 	test := setupServiceTest(t)
 	defer test.Cleanup()

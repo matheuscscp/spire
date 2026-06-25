@@ -75,6 +75,10 @@ type WorkloadX509SVIDParams struct {
 	// SPIFFE ID of the SVID
 	SPIFFEID spiffeid.ID
 
+	// AgentNodeName is the Kubernetes node name of the agent that requested
+	// the SVID.
+	AgentNodeName string
+
 	// DNSNames is used to add DNS SAN's to the X509 SVID. The first entry
 	// is also added as the CN.
 	DNSNames []string
@@ -339,12 +343,13 @@ func (ca *CA) SignWorkloadX509SVID(ctx context.Context, params WorkloadX509SVIDP
 	}
 
 	template, err := ca.c.CredBuilder.BuildWorkloadX509SVIDTemplate(ctx, credtemplate.WorkloadX509SVIDParams{
-		ParentChain: caChain,
-		PublicKey:   params.PublicKey,
-		SPIFFEID:    params.SPIFFEID,
-		DNSNames:    params.DNSNames,
-		TTL:         params.TTL,
-		Subject:     params.Subject,
+		ParentChain:   caChain,
+		PublicKey:     params.PublicKey,
+		SPIFFEID:      params.SPIFFEID,
+		AgentNodeName: params.AgentNodeName,
+		DNSNames:      params.DNSNames,
+		TTL:           params.TTL,
+		Subject:       params.Subject,
 	})
 	if err != nil {
 		return nil, err

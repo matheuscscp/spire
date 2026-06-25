@@ -91,12 +91,13 @@ type AgentX509SVIDParams struct {
 }
 
 type WorkloadX509SVIDParams struct {
-	ParentChain []*x509.Certificate
-	PublicKey   crypto.PublicKey
-	SPIFFEID    spiffeid.ID
-	DNSNames    []string
-	TTL         time.Duration
-	Subject     pkix.Name
+	ParentChain   []*x509.Certificate
+	PublicKey     crypto.PublicKey
+	SPIFFEID      spiffeid.ID
+	AgentNodeName string
+	DNSNames      []string
+	TTL           time.Duration
+	Subject       pkix.Name
 }
 
 type WorkloadJWTSVIDParams struct {
@@ -310,6 +311,13 @@ func (b *Builder) BuildWorkloadX509SVIDTemplate(ctx context.Context, params Work
 	if len(params.DNSNames) > 0 {
 		tmpl.Subject.CommonName = params.DNSNames[0]
 		tmpl.DNSNames = params.DNSNames
+	}
+	if params.AgentNodeName != "" {
+		extension, err := x509util.NewAgentNodeNameExtension(params.AgentNodeName)
+		if err != nil {
+			return nil, err
+		}
+		tmpl.ExtraExtensions = append(tmpl.ExtraExtensions, extension)
 	}
 
 	for _, cc := range b.config.CredentialComposers {

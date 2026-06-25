@@ -149,7 +149,7 @@ spec:
         type: Directory
 
 ---
-# Broker whose k8s attestor pod reference scope is `agent_node`.
+# Broker whose k8s attestor pod reference scope is `broker_node`.
 apiVersion: v1
 kind: Pod
 metadata:

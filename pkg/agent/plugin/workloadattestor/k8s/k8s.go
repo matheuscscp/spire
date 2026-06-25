@@ -83,8 +83,8 @@ const (
 type podReferenceScope string
 
 const (
-	podReferenceScopeAgentNode podReferenceScope = "agent_node"
-	podReferenceScopeCluster   podReferenceScope = "cluster"
+	podReferenceScopeBrokerNode podReferenceScope = "broker_node"
+	podReferenceScopeCluster    podReferenceScope = "cluster"
 )
 
 var (
@@ -401,13 +401,13 @@ func buildBrokerConfig(brokerConfig *k8sBrokerHCLConfig, status *pluginconf.Stat
 func buildPodReferenceScope(brokerID string, hclValue string, status *pluginconf.Status) (podReferenceScope, bool) {
 	switch hclValue {
 	case "":
-		return podReferenceScopeAgentNode, true
-	case string(podReferenceScopeAgentNode):
-		return podReferenceScopeAgentNode, true
+		return podReferenceScopeBrokerNode, true
+	case string(podReferenceScopeBrokerNode):
+		return podReferenceScopeBrokerNode, true
 	case string(podReferenceScopeCluster):
 		return podReferenceScopeCluster, true
 	default:
-		status.ReportErrorf("broker.brokers[%s].pod_reference_scope: unsupported value %q; must be one of [agent_node, cluster]", brokerID, hclValue)
+		status.ReportErrorf("broker.brokers[%s].pod_reference_scope: unsupported value %q; must be one of [broker_node, cluster]", brokerID, hclValue)
 		return "", false
 	}
 }
@@ -744,8 +744,8 @@ func (p *Plugin) attestByPID(ctx context.Context, pid int32) (*workloadattestorv
 // ("if both key and uid are supplied, the resolved pod's UID MUST match the
 // supplied uid"). Resolution tries the kubelet pod list first (cheap,
 // node-local, indexed by UID — same path the legacy PID flow uses), then
-// falls back to the API server when needed. Under agent_node scope, API
-// server results must still match the agent node name. Selector emission uses pod-shaped selectors
+// falls back to the API server when needed. Under broker_node scope, API
+// server results must still match the broker node name. Selector emission uses pod-shaped selectors
 // (sa, ns, pod-uid, pod-name, pod-image, pod-label, pod-owner, ...), distinct
 // from the generic-object vocabulary so registration entries
 // can match pod-specific fields like container images and service accounts
@@ -761,15 +761,21 @@ func (p *Plugin) attestByPodReference(ctx context.Context, brokerEntry *k8sBroke
 		return nil, err
 	}
 
+	scope := brokerPodReferenceScope(brokerEntry)
+	scopeNodeName, err := podReferenceScopeNodeName(ctx, brokerEntry, scope)
+	if err != nil {
+		return nil, err
+	}
+
 	var pod *corev1.Pod
 	switch {
 	case name != "":
 		if namespace == "" {
 			return nil, ErrNamespaceRequired
 		}
-		pod, err = p.findPodByName(ctx, config, namespace, name, brokerPodReferenceScope(brokerEntry))
+		pod, err = p.findPodByName(ctx, config, namespace, name, scope, scopeNodeName)
 	default:
-		pod, err = p.findPodByUID(ctx, config, uid, brokerPodReferenceScope(brokerEntry))
+		pod, err = p.findPodByUID(ctx, config, uid, scope, scopeNodeName)
 	}
 	if err != nil {
 		return nil, err
@@ -791,9 +797,23 @@ func (p *Plugin) attestByPodReference(ctx context.Context, brokerEntry *k8sBroke
 
 func brokerPodReferenceScope(brokerEntry *k8sBrokerEntry) podReferenceScope {
 	if brokerEntry == nil {
-		return podReferenceScopeAgentNode
+		return podReferenceScopeCluster
 	}
 	return brokerEntry.PodReferenceScope
+}
+
+func podReferenceScopeNodeName(ctx context.Context, brokerEntry *k8sBrokerEntry, scope podReferenceScope) (string, error) {
+	if scope != podReferenceScopeBrokerNode || brokerEntry == nil {
+		return "", nil
+	}
+	nodeName, ok, err := brokercontext.CallerNodeNameFromContext(ctx)
+	if err != nil {
+		return "", status.Errorf(codes.Internal, "unable to determine broker node name: %v", err)
+	}
+	if !ok {
+		return "", status.Error(codes.PermissionDenied, "broker X509-SVID is missing broker node name")
+	}
+	return nodeName, nil
 }
 
 // findPodByName resolves a single pod by its namespaced name. The kubelet
@@ -801,9 +821,9 @@ func brokerPodReferenceScope(brokerEntry *k8sBrokerEntry) podReferenceScope {
 // is indexed by UID, not name) but n is small in practice and saves an API
 // server round-trip when the pod is local. If the pod is not in the kubelet
 // list, the apiserver answers a precise Get directly — no list, no
-// client-side filter. Under agent_node scope, the resolved pod must still be
-// scheduled to the configured agent node.
-func (p *Plugin) findPodByName(ctx context.Context, config *k8sConfig, namespace, name string, scope podReferenceScope) (*corev1.Pod, error) {
+// client-side filter. Under broker_node scope, the resolved pod must still be
+// scheduled to the broker node.
+func (p *Plugin) findPodByName(ctx context.Context, config *k8sConfig, namespace, name string, scope podReferenceScope, scopeNodeName string) (*corev1.Pod, error) {
 	// Try kubelet pod list first; iterate to find a match by namespace+name.
 	podList, err := p.getPodList(ctx, config.Client, config.PollRetryInterval/2)
 	if err != nil {
@@ -816,7 +836,16 @@ func (p *Plugin) findPodByName(ctx context.Context, config *k8sConfig, namespace
 		if string(podValue.GetStringBytes("metadata", "name")) != name {
 			continue
 		}
-		return decodePodFromKubelet(podValue)
+		pod, err := decodePodFromKubelet(podValue)
+		if err != nil {
+			return nil, err
+		}
+		if scopeNodeName != "" {
+			if err := checkPodReferenceScope(scope, scopeNodeName, pod); err != nil {
+				return nil, err
+			}
+		}
+		return pod, nil
 	}
 
 	// Fallback: direct Get from API server.
@@ -831,7 +860,7 @@ func (p *Plugin) findPodByName(ctx context.Context, config *k8sConfig, namespace
 		}
 		return nil, status.Errorf(codes.Internal, "unable to get pod from Kubernetes API: %v", err)
 	}
-	if err := checkPodReferenceScope(scope, config.NodeName, pod); err != nil {
+	if err := checkPodReferenceScope(scope, scopeNodeName, pod); err != nil {
 		return nil, err
 	}
 	return pod, nil
@@ -842,16 +871,25 @@ func (p *Plugin) findPodByName(ctx context.Context, config *k8sConfig, namespace
 // pods scheduled to this node — both common-case wins. If the pod is not in
 // the kubelet list, it falls back to a cluster-wide List from the API server.
 // Kubernetes does not support `metadata.uid` as a field selector, so we list
-// and filter client-side regardless. Under agent_node scope, the resolved pod
-// must still be scheduled to the configured agent node.
-func (p *Plugin) findPodByUID(ctx context.Context, config *k8sConfig, uid types.UID, scope podReferenceScope) (*corev1.Pod, error) {
+// and filter client-side regardless. Under broker_node scope, the resolved pod
+// must still be scheduled to the broker node.
+func (p *Plugin) findPodByUID(ctx context.Context, config *k8sConfig, uid types.UID, scope podReferenceScope, scopeNodeName string) (*corev1.Pod, error) {
 	// Try kubelet pod list first (already indexed by UID).
 	podList, err := p.getPodList(ctx, config.Client, config.PollRetryInterval/2)
 	if err != nil {
 		return nil, err
 	}
 	if podValue, ok := podList[string(uid)]; ok {
-		return decodePodFromKubelet(podValue)
+		pod, err := decodePodFromKubelet(podValue)
+		if err != nil {
+			return nil, err
+		}
+		if scopeNodeName != "" {
+			if err := checkPodReferenceScope(scope, scopeNodeName, pod); err != nil {
+				return nil, err
+			}
+		}
+		return pod, nil
 	}
 
 	// Fallback: list all pods via API server. k8s doesn't support
@@ -868,7 +906,7 @@ func (p *Plugin) findPodByUID(ctx context.Context, config *k8sConfig, uid types.
 		if pods.Items[i].UID != uid {
 			continue
 		}
-		if err := checkPodReferenceScope(scope, config.NodeName, &pods.Items[i]); err != nil {
+		if err := checkPodReferenceScope(scope, scopeNodeName, &pods.Items[i]); err != nil {
 			return nil, err
 		}
 		return &pods.Items[i], nil
@@ -876,15 +914,15 @@ func (p *Plugin) findPodByUID(ctx context.Context, config *k8sConfig, uid types.
 	return nil, status.Errorf(codes.NotFound, "pod with UID %s not found", uid)
 }
 
-func checkPodReferenceScope(scope podReferenceScope, agentNodeName string, pod *corev1.Pod) error {
-	if scope != podReferenceScopeAgentNode {
+func checkPodReferenceScope(scope podReferenceScope, brokerNodeName string, pod *corev1.Pod) error {
+	if scope != podReferenceScopeBrokerNode {
 		return nil
 	}
-	if agentNodeName == "" {
-		return status.Error(codes.Internal, "agent node name is not configured")
+	if brokerNodeName == "" {
+		return status.Error(codes.Internal, "broker node name is not configured")
 	}
-	if pod.Spec.NodeName != agentNodeName {
-		return status.Error(codes.PermissionDenied, "pod is not on the agent node")
+	if pod.Spec.NodeName != brokerNodeName {
+		return status.Error(codes.PermissionDenied, "pod is not on the broker node")
 	}
 	return nil
 }

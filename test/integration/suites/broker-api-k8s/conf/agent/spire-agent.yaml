@@ -174,7 +174,7 @@ data:
               },
               {
                 id = "spiffe://example.org/agent-node-broker"
-                pod_reference_scope = "agent_node"
+                pod_reference_scope = "broker_node"
               },
               {
                 id = "spiffe://example.org/restricted-broker"
